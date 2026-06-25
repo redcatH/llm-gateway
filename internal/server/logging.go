@@ -70,12 +70,16 @@ func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 //     （表现为客户端 ConnectionRefused + 无结构化日志）。此处捕获后记 Error + 返回 500。
 func loggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 健康检查是基础设施探测（Docker 每 30s 一次），无业务价值，跳过访问日志避免刷屏。
+		isHealth := r.URL.Path == "/health"
 		start := time.Now()
-		logger.Debug("request start",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"remote", r.RemoteAddr,
-		)
+		if !isHealth {
+			logger.Debug("request start",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"remote", r.RemoteAddr,
+			)
+		}
 		rec := &statusRecorder{ResponseWriter: w}
 		defer func() {
 			if rcv := recover(); rcv != nil {
@@ -94,6 +98,9 @@ func loggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 		}()
 		next.ServeHTTP(rec, r)
 
+		if isHealth {
+			return
+		}
 		logger.Info("request",
 			"method", r.Method,
 			"path", r.URL.Path,
