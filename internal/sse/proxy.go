@@ -275,22 +275,36 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 	copyBodyAndFlush(w, resp.Body)
 }
 
-// forwardStream 放行 SSE 流：写响应头 + 已 peek 字节 + 剩余 body，逐段 flush。
+// forwardStream 放行 SSE 流：写响应头 + 已 peek 字节 + 剩余 body，逐帧 flush。
 // 已 peek 的字节先写出再续传剩余，保证透传字节级完整。
+//
+// 关键：剩余 body 必须逐块读 + 每次立即 flush，不能用 io.Copy——
+// io.Copy 用 32KB 缓冲且不 flush，< 32KB 的响应会缓冲到 EOF 才下发，
+// 破坏 SSE 逐帧流式（下游要等所有内容到达才收到）。
 func forwardStream(w http.ResponseWriter, resp *http.Response, peeked []byte, br *bufio.Reader) {
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	flusher, _ := w.(http.Flusher)
-	if len(peeked) > 0 {
-		_, _ = w.Write(peeked)
+	flush := func() {
 		if flusher != nil {
 			flusher.Flush()
 		}
 	}
-	// br 已消费首事件，继续读剩余 body。
-	_, _ = io.Copy(w, br)
-	if flusher != nil {
-		flusher.Flush()
+	if len(peeked) > 0 {
+		_, _ = w.Write(peeked)
+		flush()
+	}
+	// 逐块读取剩余 body，每块立即 flush，保证 SSE 逐帧下发。
+	buf := make([]byte, 4096)
+	for {
+		n, err := br.Read(buf)
+		if n > 0 {
+			_, _ = w.Write(buf[:n])
+			flush()
+		}
+		if err != nil {
+			break
+		}
 	}
 }
 
