@@ -1,0 +1,20 @@
+# 构建产物
+/bin/
+/gateway
+/gateway.exe
+*.exe
+*.test
+*.out
+
+# 本地环境配置（含密钥，禁止提交）
+.env
+.env.*
+
+# 编辑器/IDE
+.idea/
+.vscode/
+*.swp
+
+# 操作系统
+.DS_Store
+Thumbs.db

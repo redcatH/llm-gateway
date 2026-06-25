@@ -1,0 +1,138 @@
+// Package config 负责从环境变量加载并校验网关运行配置。
+// 刻意不引入 viper 等第三方库，仅用标准库，保持零依赖。
+package config
+
+import (
+	"fmt"
+	"log/slog"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Config 持有网关运行所需的全部配置，全部来自环境变量。
+type Config struct {
+	// UpstreamURL 是所有 /v1/* 请求透传的目标地址（单一固定上游）。
+	UpstreamURL *url.URL
+	// ListenAddr 是网关监听地址，如 ":8080"。
+	ListenAddr string
+	// ReadHeaderTimeout 限制读取请求头的最长时间，用于防御慢速攻击。
+	// 注意：不设 ReadTimeout/WriteTimeout，避免切断 SSE 长连接。
+	ReadHeaderTimeout time.Duration
+	// MaxIdleConnsPerHost 是到上游的每主机空闲连接数（连接池大小）。
+	MaxIdleConnsPerHost int
+	// IdleConnTimeout 是上游空闲连接的超时时间。
+	IdleConnTimeout time.Duration
+	// UpstreamInsecureSkipVerify 是否跳过上游 TLS 证书校验（仅调试用）。
+	UpstreamInsecureSkipVerify bool
+	// PreserveHost 为 true 时保留客户端原始 Host 头转发；
+	// 默认 false，使用上游 Host（标准反向代理行为）。
+	PreserveHost bool
+	// LogLevel 是 slog 日志级别。
+	LogLevel slog.Level
+}
+
+// Load 从环境变量读取并校验配置。缺少必填项或格式非法时返回错误，
+// 调用方应据此在启动阶段直接退出。
+func Load() (*Config, error) {
+	raw := os.Getenv("UPSTREAM_URL")
+	if raw == "" {
+		return nil, fmt.Errorf("UPSTREAM_URL is required (e.g. https://api.example.com)")
+	}
+	upstream, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid UPSTREAM_URL %q: %w", raw, err)
+	}
+	if upstream.Scheme != "http" && upstream.Scheme != "https" {
+		return nil, fmt.Errorf("UPSTREAM_URL must use http or https scheme, got %q", upstream.Scheme)
+	}
+	if upstream.Host == "" {
+		return nil, fmt.Errorf("UPSTREAM_URL must contain a host")
+	}
+
+	readHeaderTimeout, err := envDuration("READ_HEADER_TIMEOUT", 10*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	idleConnTimeout, err := envDuration("IDLE_CONN_TIMEOUT", 90*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	maxIdle, err := envInt("MAX_IDLE_CONNS_PER_HOST", 100)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Config{
+		UpstreamURL:                upstream,
+		ListenAddr:                 envString("LISTEN_ADDR", ":8080"),
+		ReadHeaderTimeout:          readHeaderTimeout,
+		MaxIdleConnsPerHost:        maxIdle,
+		IdleConnTimeout:            idleConnTimeout,
+		UpstreamInsecureSkipVerify: envBool("UPSTREAM_INSECURE_SKIP_VERIFY", false),
+		PreserveHost:               envBool("PRESERVE_HOST", false),
+		LogLevel:                   envLevel("LOG_LEVEL", slog.LevelInfo),
+	}, nil
+}
+
+// ── 环境变量解析辅助函数 ──
+
+func envString(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envBool(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return def
+	}
+	return b
+}
+
+func envInt(key string, def int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid int for %s=%q: %w", key, v, err)
+	}
+	return n, nil
+}
+
+func envDuration(key string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid duration for %s=%q: %w", key, v, err)
+	}
+	return d, nil
+}
+
+func envLevel(key string, def slog.Level) slog.Level {
+	switch strings.ToLower(os.Getenv(key)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	case "info":
+		return slog.LevelInfo
+	default:
+		return def
+	}
+}

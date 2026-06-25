@@ -1,0 +1,74 @@
+// xunfei-gateway 是一个透明透传的 LLM API 反向代理网关。
+// 处理 /v1/chat/completions（OpenAI 协议）与 /v1/messages（Anthropic 协议），
+// 将所有请求头与请求体原样转发到单一固定上游。
+package main
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"xunfei-gateway/internal/config"
+	"xunfei-gateway/internal/proxy"
+	"xunfei-gateway/internal/server"
+)
+
+func main() {
+	cfg, err := config.Load()
+	if err != nil {
+		// 配置阶段 logger 尚未初始化，用默认 logger 输出后退出。
+		slog.Error("invalid config", "err", err.Error())
+		os.Exit(1)
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: cfg.LogLevel,
+	}))
+	slog.SetDefault(logger)
+
+	rp := proxy.New(cfg, logger)
+	srv := server.New(cfg, rp, logger)
+
+	logger.Info("starting transparent gateway",
+		"listen", cfg.ListenAddr,
+		"upstream", cfg.UpstreamURL.String(),
+		"preserve_host", cfg.PreserveHost,
+		"max_idle_conns_per_host", cfg.MaxIdleConnsPerHost,
+	)
+
+	// 在独立 goroutine 中监听，主 goroutine 等待退出信号。
+	serveErr := make(chan error, 1)
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
+
+	// 捕获中断信号以触发优雅关闭。
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	select {
+	case <-stop:
+		logger.Info("shutdown signal received, draining in-flight requests")
+	case err := <-serveErr:
+		logger.Error("server failed to start", "err", err.Error())
+		os.Exit(1)
+	}
+
+	// 给在途请求（含进行中的 SSE 流）最多 30 秒完成。
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		logger.Error("graceful shutdown failed", "err", err.Error())
+		os.Exit(1)
+	}
+	logger.Info("server stopped cleanly")
+}
