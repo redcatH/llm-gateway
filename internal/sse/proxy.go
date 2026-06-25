@@ -129,14 +129,13 @@ func handleSSEResponse(w http.ResponseWriter, resp *http.Response, rules []Rule,
 }
 
 // buildUpstreamRequest 构造转发到上游的请求：
-// 复制入站 header/body，URL 用 target 的 scheme/host + 原始 path/query，清空 RequestURI。
+// 复制入站 header/body，URL 用 target 的 scheme/host + 重写后的 path + 原始 query，清空 RequestURI。
 func buildUpstreamRequest(req *http.Request, target *url.URL, preserveHost bool) *http.Request {
 	outReq := req.Clone(req.Context())
 	outReq.URL = &url.URL{
 		Scheme:   target.Scheme,
 		Host:     target.Host,
-		Path:     req.URL.Path,
-		RawPath:  req.URL.RawPath,
+		Path:     routing.RewritePath(target, req.URL.Path),
 		RawQuery: req.URL.RawQuery,
 		Fragment: req.URL.Fragment,
 	}

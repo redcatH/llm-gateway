@@ -59,6 +59,9 @@ func New(cfg *config.Config, transport http.RoundTripper, logger *slog.Logger) *
 			// 按请求协议（路径）选上游；header 与 body 由 ReverseProxy 原样透传。
 			target := routing.SelectTarget(r.In, cfg.OpenAITarget, cfg.AnthropicTarget)
 			r.SetURL(target)
+			// 路径重写：上游以 / 结尾时剥离 /v1 前缀拼接到上游路径后
+			r.Out.URL.Path = routing.RewritePath(target, r.In.URL.Path)
+			r.Out.URL.RawPath = ""
 			if cfg.PreserveHost {
 				// SetURL 会把 Out.Host 改为上游 Host；此处按需恢复客户端原始 Host。
 				r.Out.Host = r.In.Host

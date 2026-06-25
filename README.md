@@ -31,6 +31,23 @@
 
 至少需配置 `UPSTREAM_URL`，或同时配置两个协议专用上游。
 
+### 路径重写
+
+上游 URL **以 `/` 结尾**时，网关会剥离客户端路径的 `/v1` 前缀，拼接到上游路径后：
+
+| 上游 URL | 客户端请求 | 实际上游路径 |
+|---|---|---|
+| `https://host/v2/` | `/v1/messages` | `/v2/messages` |
+| `https://host/v2/` | `/v1/chat/completions` | `/v2/chat/completions` |
+| `https://host/` | `/v1/messages` | `/messages` |
+
+上游 URL **不以 `/` 结尾**时，客户端路径原样透传（默认行为）：
+
+| 上游 URL | 客户端请求 | 实际上游路径 |
+|---|---|---|
+| `https://host` | `/v1/messages` | `/v1/messages` |
+| `https://api.openai.com` | `/v1/chat/completions` | `/v1/chat/completions` |
+
 ## SSE 拦截规则
 
 启用 `SSE_INTERCEPT_ENABLED`（默认开）时，对上游 200+SSE 响应做首帧 peek，
