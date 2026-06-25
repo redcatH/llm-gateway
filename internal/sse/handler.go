@@ -1,0 +1,74 @@
+package sse
+
+import (
+	"encoding/json"
+	"net/http"
+	"strconv"
+)
+
+// Decision 是 Handler 对命中 error 的处理决策。
+type Decision struct {
+	// Intercept 为 true 表示拦截（不透传原流），按下方字段返回响应；
+	// 为 false 表示放行原样透传。
+	Intercept bool
+	// Status 是拦截时的 HTTP 状态码。
+	Status int
+	// Body 是拦截时的响应体。
+	Body []byte
+	// Headers 是拦截时的响应头（如 Retry-After、Content-Type）。
+	Headers http.Header
+}
+
+// Handler 处理一个命中的 SSE error，返回决策。
+// 实现可以是"返回 503 客户端重试""网关自重试""仅记录"等，逐步完善。
+type Handler func(req *http.Request, m Match) Decision
+
+// DefaultRules 返回初始规则集。命中任一规则即拦截并返回 503 + Retry-After，
+// 让客户端 SDK 自动重试。后续新增规则只需在此 append。
+func DefaultRules(retryAfter int) []Rule {
+	return []Rule{
+		{
+			// 10012 EngineInternalError:1105（The system is busy）。
+			// 多子串 AND：同时含 "EngineInternalError" 与 "1105"，避免误匹配 Bad Request 子类型。
+			Code:        10012,
+			MsgContains: []string{"EngineInternalError", "1105"},
+			Handler:     retryableHandler(retryAfter),
+		},
+		{
+			// 10010 RecvFromEngineError:Engine Busy —— 引擎忙，临时性可重试。
+			// 多子串 AND：同时含 "RecvFromEngineError" 与 "Engine Busy"，避免误匹配 10110。
+			Code:        10010,
+			MsgContains: []string{"RecvFromEngineError", "Engine Busy"},
+			Handler:     retryableHandler(retryAfter),
+		},
+		{
+			// 11210 NotEnoughCvError —— 并发/容量不足，退避后重试。
+			Code:        11210,
+			MsgContains: []string{"NotEnoughCvError"},
+			Handler:     retryableHandler(retryAfter),
+		},
+	}
+}
+
+// retryableHandler 返回一个 Handler：拦截并返回 503 + Retry-After + JSON error。
+// 文案通用，不泄漏上游供应商标识；客户端 SDK（OpenAI/Anthropic）默认会重试 5xx。
+func retryableHandler(retryAfter int) Handler {
+	return func(req *http.Request, m Match) Decision {
+		body, _ := json.Marshal(map[string]any{
+			"error": map[string]any{
+				"code":    "upstream_overloaded",
+				"message": "upstream engine busy, please retry",
+				"type":    "server_error",
+			},
+		})
+		h := http.Header{}
+		h.Set("Content-Type", "application/json")
+		h.Set("Retry-After", strconv.Itoa(retryAfter))
+		return Decision{
+			Intercept: true,
+			Status:    http.StatusServiceUnavailable, // 503
+			Body:      body,
+			Headers:   h,
+		}
+	}
+}

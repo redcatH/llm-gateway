@@ -14,8 +14,20 @@ import (
 
 // Config 持有网关运行所需的全部配置，全部来自环境变量。
 type Config struct {
-	// UpstreamURL 是所有 /v1/* 请求透传的目标地址（单一固定上游）。
+	// UpstreamURL 是默认/兜底上游（向后兼容）。当未配置协议专用上游时使用。
+	// 可为 nil（此时 OpenAI/Anthropic 专用上游必须都配置）。
 	UpstreamURL *url.URL
+	// UpstreamOpenAIURL 是 OpenAI 协议（/v1/chat/completions 等）的专用上游（可选）。
+	// 未配置时回退到 UpstreamURL。
+	UpstreamOpenAIURL *url.URL
+	// UpstreamAnthropicURL 是 Anthropic 协议（/v1/messages）的专用上游（可选）。
+	// 未配置时回退到 UpstreamURL。
+	UpstreamAnthropicURL *url.URL
+	// OpenAITarget 是解析后的 OpenAI 路由目标（UpstreamOpenAIURL ?? UpstreamURL），必非空。
+	OpenAITarget *url.URL
+	// AnthropicTarget 是解析后的 Anthropic 路由目标（UpstreamAnthropicURL ?? UpstreamURL），必非空。
+	AnthropicTarget *url.URL
+
 	// ListenAddr 是网关监听地址，如 ":8080"。
 	ListenAddr string
 	// ReadHeaderTimeout 限制读取请求头的最长时间，用于防御慢速攻击。
@@ -32,24 +44,44 @@ type Config struct {
 	PreserveHost bool
 	// LogLevel 是 slog 日志级别。
 	LogLevel slog.Level
+	// SSEInterceptEnabled 是否启用 SSE error 拦截。
+	// true 时对上游 200+SSE 响应做首帧 peek，命中规则则拦截；
+	// false 时全部走纯透传（不 peek）。
+	SSEInterceptEnabled bool
+	// SSERetryAfter 是拦截后 503 响应的 Retry-After 秒数。
+	SSERetryAfter int
 }
 
 // Load 从环境变量读取并校验配置。缺少必填项或格式非法时返回错误，
 // 调用方应据此在启动阶段直接退出。
 func Load() (*Config, error) {
-	raw := os.Getenv("UPSTREAM_URL")
-	if raw == "" {
-		return nil, fmt.Errorf("UPSTREAM_URL is required (e.g. https://api.example.com)")
-	}
-	upstream, err := url.Parse(raw)
+	upstreamURL, err := parseUpstreamURL("UPSTREAM_URL")
 	if err != nil {
-		return nil, fmt.Errorf("invalid UPSTREAM_URL %q: %w", raw, err)
+		return nil, err
 	}
-	if upstream.Scheme != "http" && upstream.Scheme != "https" {
-		return nil, fmt.Errorf("UPSTREAM_URL must use http or https scheme, got %q", upstream.Scheme)
+	openaiURL, err := parseUpstreamURL("UPSTREAM_OPENAI_URL")
+	if err != nil {
+		return nil, err
 	}
-	if upstream.Host == "" {
-		return nil, fmt.Errorf("UPSTREAM_URL must contain a host")
+	anthropicURL, err := parseUpstreamURL("UPSTREAM_ANTHROPIC_URL")
+	if err != nil {
+		return nil, err
+	}
+
+	// 协议专用上游未配置时回退到默认上游。
+	openaiTarget := openaiURL
+	if openaiTarget == nil {
+		openaiTarget = upstreamURL
+	}
+	anthropicTarget := anthropicURL
+	if anthropicTarget == nil {
+		anthropicTarget = upstreamURL
+	}
+	if openaiTarget == nil {
+		return nil, fmt.Errorf("no OpenAI upstream: set UPSTREAM_OPENAI_URL or UPSTREAM_URL")
+	}
+	if anthropicTarget == nil {
+		return nil, fmt.Errorf("no Anthropic upstream: set UPSTREAM_ANTHROPIC_URL or UPSTREAM_URL")
 	}
 
 	readHeaderTimeout, err := envDuration("READ_HEADER_TIMEOUT", 10*time.Second)
@@ -64,9 +96,17 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	retryAfter, err := envInt("SSE_RETRY_AFTER", 5)
+	if err != nil {
+		return nil, err
+	}
 
 	return &Config{
-		UpstreamURL:                upstream,
+		UpstreamURL:                upstreamURL,
+		UpstreamOpenAIURL:          openaiURL,
+		UpstreamAnthropicURL:       anthropicURL,
+		OpenAITarget:               openaiTarget,
+		AnthropicTarget:            anthropicTarget,
 		ListenAddr:                 envString("LISTEN_ADDR", ":8080"),
 		ReadHeaderTimeout:          readHeaderTimeout,
 		MaxIdleConnsPerHost:        maxIdle,
@@ -74,10 +114,31 @@ func Load() (*Config, error) {
 		UpstreamInsecureSkipVerify: envBool("UPSTREAM_INSECURE_SKIP_VERIFY", false),
 		PreserveHost:               envBool("PRESERVE_HOST", false),
 		LogLevel:                   envLevel("LOG_LEVEL", slog.LevelInfo),
+		SSEInterceptEnabled:        envBool("SSE_INTERCEPT_ENABLED", true),
+		SSERetryAfter:              retryAfter,
 	}, nil
 }
 
 // ── 环境变量解析辅助函数 ──
+
+// parseUpstreamURL 解析一个可选的上游 URL 环境变量。未设置时返回 (nil, nil)。
+func parseUpstreamURL(key string) (*url.URL, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("invalid %s %q: %w", key, raw, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("%s must use http or https scheme, got %q", key, u.Scheme)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("%s must contain a host", key)
+	}
+	return u, nil
+}
 
 func envString(key, def string) string {
 	if v := os.Getenv(key); v != "" {

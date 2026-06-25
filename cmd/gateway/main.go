@@ -1,6 +1,7 @@
 // xunfei-gateway 是一个透明透传的 LLM API 反向代理网关。
 // 处理 /v1/chat/completions（OpenAI 协议）与 /v1/messages（Anthropic 协议），
-// 将所有请求头与请求体原样转发到单一固定上游。
+// 将所有请求头与请求体原样转发到单一固定上游；并对上游 200+SSE 的 error 帧
+// 做首帧 peek 拦截（命中规则时返回 503 让客户端重试）。
 package main
 
 import (
@@ -16,6 +17,7 @@ import (
 	"xunfei-gateway/internal/config"
 	"xunfei-gateway/internal/proxy"
 	"xunfei-gateway/internal/server"
+	"xunfei-gateway/internal/sse"
 )
 
 func main() {
@@ -31,13 +33,28 @@ func main() {
 	}))
 	slog.SetDefault(logger)
 
-	rp := proxy.New(cfg, logger)
-	srv := server.New(cfg, rp, logger)
+	// 共享 Transport：ReverseProxy 与 sse.ProxyHandler 复用同一连接池。
+	transport := proxy.NewTransport(cfg)
+
+	// 按 SSE_INTERCEPT_ENABLED 选择 handler：
+	//   启用 → sse.ProxyHandler（首帧 peek 拦截 + 透传）
+	//   关闭 → ReverseProxy 纯透传回退
+	var handler http.Handler
+	if cfg.SSEInterceptEnabled {
+		rules := sse.DefaultRules(cfg.SSERetryAfter)
+		handler = sse.ProxyHandler(cfg.OpenAITarget, cfg.AnthropicTarget, cfg.PreserveHost, transport, rules, logger)
+	} else {
+		handler = proxy.New(cfg, transport, logger)
+	}
+
+	srv := server.New(cfg, handler, logger)
 
 	logger.Info("starting transparent gateway",
 		"listen", cfg.ListenAddr,
-		"upstream", cfg.UpstreamURL.String(),
+		"upstream_openai", cfg.OpenAITarget.String(),
+		"upstream_anthropic", cfg.AnthropicTarget.String(),
 		"preserve_host", cfg.PreserveHost,
+		"sse_intercept", cfg.SSEInterceptEnabled,
 		"max_idle_conns_per_host", cfg.MaxIdleConnsPerHost,
 	)
 
