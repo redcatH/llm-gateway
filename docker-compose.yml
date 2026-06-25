@@ -21,6 +21,8 @@ services:
     # image: ghcr.io/redcath/llm-gateway:latest
     container_name: llm-gateway
     restart: unless-stopped
+    # 以 root 运行，避免 bind mount 的 ./logs 目录权限问题（宿主目录属主非 uid 1000 时写失败）。
+    user: "0:0"
     ports:
       - "8080:8080"
     environment:
@@ -39,5 +41,5 @@ services:
       SSE_INTERCEPT_ENABLED: ${SSE_INTERCEPT_ENABLED:-true}
       SSE_RETRY_AFTER: ${SSE_RETRY_AFTER:-5}
     volumes:
-      # 容器以非 root(uid 1000) 运行；若启动报日志目录权限错误：chown -R 1000:1000 ./logs
+      # 以 root 运行，无需手动 chown；日志直接写宿主机 ./logs 目录。
       - ./logs:/app/logs
