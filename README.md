@@ -33,7 +33,9 @@
 
 ### 路径重写
 
-上游 URL **以 `/` 结尾**时，网关会剥离客户端路径的 `/v1` 前缀，拼接到上游路径后：
+根据上游 URL **是否以 `/` 结尾**，采用不同的拼接策略：
+
+**以 `/` 结尾** → 剥离客户端路径的 `/v1` 前缀，拼接到上游路径后（适用于上游路径已含版本号）：
 
 | 上游 URL | 客户端请求 | 实际上游路径 |
 |---|---|---|
@@ -41,7 +43,14 @@
 | `https://host/v2/` | `/v1/chat/completions` | `/v2/chat/completions` |
 | `https://host/` | `/v1/messages` | `/messages` |
 
-上游 URL **不以 `/` 结尾**时，客户端路径原样透传（默认行为）：
+**不以 `/` 结尾** → 上游路径 + 客户端完整路径（适用于上游路径是前缀，如 `/anthropic`）：
+
+| 上游 URL | 客户端请求 | 实际上游路径 |
+|---|---|---|
+| `https://host/anthropic` | `/v1/messages` | `/anthropic/v1/messages` |
+| `https://host/anthropic` | `/v1/chat/completions` | `/anthropic/v1/chat/completions` |
+
+**无路径**（仅 `scheme://host`）→ 客户端路径原样透传：
 
 | 上游 URL | 客户端请求 | 实际上游路径 |
 |---|---|---|

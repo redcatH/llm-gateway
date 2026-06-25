@@ -15,7 +15,9 @@ func TestRewritePath(t *testing.T) {
 		{"https://host/v2/", "/v1/chat/completions", "/v2/chat/completions"},
 		{"https://host/", "/v1/messages", "/messages"},
 		{"https://host", "/v1/messages", "/v1/messages"},
-		{"https://host/v2", "/v1/messages", "/v1/messages"},
+		{"https://host/anthropic", "/v1/messages", "/anthropic/v1/messages"},
+		{"https://host/anthropic", "/v1/chat/completions", "/anthropic/v1/chat/completions"},
+		{"https://host/v2", "/v1/messages", "/v2/v1/messages"},
 		{"https://host/api/v3/", "/v1/chat/completions", "/api/v3/chat/completions"},
 		{"https://host/v2/", "/v1/responses", "/v2/responses"},
 	}
