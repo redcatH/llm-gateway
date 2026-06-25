@@ -1,4 +1,4 @@
-# xunfei-gateway
+# llm-gateway
 
 一个**透明透传**的 LLM API 反向代理网关，用 Go 标准库实现，零第三方依赖。
 
@@ -58,7 +58,7 @@ make build        # 产出 bin/gateway
 
 ```bash
 make docker
-docker run --rm -p 8080:8080 -e UPSTREAM_URL=https://api.example.com xunfei-gateway:latest
+docker run --rm -p 8080:8080 -e UPSTREAM_URL=https://api.example.com llm-gateway:latest
 ```
 
 ## 验证

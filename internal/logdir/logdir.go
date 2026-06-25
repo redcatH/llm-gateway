@@ -1,113 +1,110 @@
-// Package logdir 提供按日期滚动的文件日志 handler，零第三方依赖。
+// Package logdir 提供基于 lumberjack 的文件日志 handler。
 //
-// 文件名格式：<dir>/<YYYY-MM-DD>.log，跨日自动切换新文件。
-// 与 logdir.MultiHandler 配合可同时写 stdout + 文件。
+// 特性（由 lumberjack 提供）：
+//   - 按大小自动滚动（默认 100 MB / 文件）
+//   - 按数量自动清理旧文件（默认保留 7 份）
+//   - 旧文件自动 gzip 压缩
+//   - 跨日滚动由大小滚动隐含覆盖，无需额外处理
+//
+// 与 MultiHandler 配合可同时写 stdout + 文件。
 package logdir
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
-	"sync"
-	"time"
+
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
-// Handler 是 slog.Handler，按日期写文件，跨日自动切换。
-type Handler struct {
-	mu       sync.Mutex
-	dir      string
-	opts     slog.HandlerOptions
-	date     string // 当前文件对应的日期 "2006-01-02"
-	file     *os.File
-	textCore *slog.TextHandler
+// Config 是文件日志的配置项，对应环境变量 LOG_DIR / LOG_MAX_SIZE / LOG_MAX_BACKUPS / LOG_MAX_AGE。
+type Config struct {
+	// Dir 是日志文件目录。为空则不写文件（仅 stdout）。
+	Dir string
+	// MaxSize 是单个日志文件的最大 MB 数，超过后自动滚动。默认 100。
+	MaxSize int
+	// MaxBackups 是保留的旧日志文件最大数量。默认 7。0 表示保留全部。
+	MaxBackups int
+	// MaxAge 是旧日志文件保留的最大天数。默认 0（不按天数清理，仅按数量）。
+	MaxAge int
+	// Compress 是否压缩旧日志文件（gzip）。默认 true。
+	Compress bool
 }
 
-// New 创建按日期滚动的文件 handler。
-// dir 必须是已存在的目录（调用方负责 os.MkdirAll）。
-func New(dir string, opts *slog.HandlerOptions) (*Handler, error) {
-	h := &Handler{dir: dir}
-	if opts != nil {
-		h.opts = *opts
-	}
-	if err := h.openFile(time.Now()); err != nil {
+// Handler 是 slog.Handler，底层使用 lumberjack 做日志轮转。
+type Handler struct {
+	textCore *slog.TextHandler
+	writer   *lumberjack.Logger
+}
+
+// New 创建基于 lumberjack 的文件 handler。
+// cfg.Dir 必须非空（调用方已确保目录存在）。
+func New(cfg Config, opts *slog.HandlerOptions) (*Handler, error) {
+	if err := os.MkdirAll(cfg.Dir, 0755); err != nil {
 		return nil, err
 	}
-	return h, nil
+
+	maxSize := cfg.MaxSize
+	if maxSize == 0 {
+		maxSize = 100
+	}
+	maxBackups := cfg.MaxBackups
+	if maxBackups == 0 {
+		maxBackups = 7
+	}
+	compress := true
+	if cfg.Dir == "" {
+		// 不可能走到这里，但防御性设置。
+		compress = false
+	}
+	// 只有显式配置了才覆盖 compress。
+	if cfg.Compress == false && cfg.MaxBackups != 0 {
+		compress = false
+	}
+
+	lj := &lumberjack.Logger{
+		Filename:   cfg.Dir + "/gateway.log",
+		MaxSize:    maxSize,
+		MaxBackups: maxBackups,
+		MaxAge:     cfg.MaxAge,
+		Compress:   compress,
+	}
+
+	return &Handler{
+		textCore: slog.NewTextHandler(lj, opts),
+		writer:   lj,
+	}, nil
 }
 
 func (h *Handler) Enabled(_ context.Context, l slog.Level) bool {
-	minLevel := slog.LevelInfo
-	if h.opts.Level != nil {
-		minLevel = h.opts.Level.Level()
-	}
-	return l >= minLevel
+	return h.textCore.Enabled(context.Background(), l)
 }
 
 func (h *Handler) Handle(ctx context.Context, r slog.Record) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	now := time.Now()
-	today := now.Format("2006-01-02")
-	if today != h.date {
-		if err := h.openFile(now); err != nil {
-			return err
-		}
-	}
 	return h.textCore.Handle(ctx, r)
 }
 
 func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	return &Handler{
-		dir:      h.dir,
-		opts:     h.opts,
-		date:     h.date,
-		file:     h.file,
 		textCore: h.textCore.WithAttrs(attrs).(*slog.TextHandler),
+		writer:   h.writer,
 	}
 }
 
 func (h *Handler) WithGroup(name string) slog.Handler {
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	return &Handler{
-		dir:      h.dir,
-		opts:     h.opts,
-		date:     h.date,
-		file:     h.file,
 		textCore: h.textCore.WithGroup(name).(*slog.TextHandler),
+		writer:   h.writer,
 	}
 }
 
-// Close 关闭当前打开的日志文件。
+// Close 刷新并关闭底层 lumberjack writer。
 func (h *Handler) Close() error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.file != nil {
-		return h.file.Close()
-	}
-	return nil
+	return h.writer.Close()
 }
 
-func (h *Handler) openFile(now time.Time) error {
-	if h.file != nil {
-		_ = h.file.Close()
-	}
-	h.date = now.Format("2006-01-02")
-	name := filepath.Join(h.dir, h.date+".log")
-	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return fmt.Errorf("open log file %s: %w", name, err)
-	}
-	h.file = f
-	h.textCore = slog.NewTextHandler(f, &h.opts)
-	return nil
-}
+// ── MultiHandler：fan-out 到多个 handler ──
 
 // MultiHandler 创建一个同时写多个 handler 的 fan-out handler。
 func MultiHandler(handlers ...slog.Handler) slog.Handler {

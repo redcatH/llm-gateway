@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 
-	"xunfei-gateway/internal/config"
+	"llm-gateway/internal/config"
 )
 
 // New 装配 http.Server。handler 由调用方决定（sse.ProxyHandler 或 ReverseProxy）。

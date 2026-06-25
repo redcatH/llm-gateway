@@ -1,4 +1,4 @@
-// xunfei-gateway 是一个透明透传的 LLM API 反向代理网关。
+// llm-gateway 是一个透明透传的 LLM API 反向代理网关。
 // 处理 /v1/chat/completions（OpenAI 协议）与 /v1/messages（Anthropic 协议），
 // 将所有请求头与请求体原样转发到单一固定上游；并对上游 200+SSE 的 error 帧
 // 做首帧 peek 拦截（命中规则时返回 503 让客户端重试）。
@@ -14,11 +14,11 @@ import (
 	"syscall"
 	"time"
 
-	"xunfei-gateway/internal/config"
-	"xunfei-gateway/internal/logdir"
-	"xunfei-gateway/internal/proxy"
-	"xunfei-gateway/internal/server"
-	"xunfei-gateway/internal/sse"
+	"llm-gateway/internal/config"
+	"llm-gateway/internal/logdir"
+	"llm-gateway/internal/proxy"
+	"llm-gateway/internal/server"
+	"llm-gateway/internal/sse"
 )
 
 func main() {
@@ -38,12 +38,14 @@ func main() {
 	var logger *slog.Logger
 	var fileHandler *logdir.Handler
 	if cfg.LogDir != "" {
-		if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
-			slog.Error("cannot create log dir", "dir", cfg.LogDir, "err", err.Error())
-			os.Exit(1)
-		}
 		var err error
-		fileHandler, err = logdir.New(cfg.LogDir, handlerOpts)
+		fileHandler, err = logdir.New(logdir.Config{
+			Dir:        cfg.LogDir,
+			MaxSize:    cfg.LogMaxSize,
+			MaxBackups: cfg.LogMaxBackups,
+			MaxAge:     cfg.LogMaxAge,
+			Compress:   cfg.LogCompress,
+		}, handlerOpts)
 		if err != nil {
 			slog.Error("cannot open log file", "dir", cfg.LogDir, "err", err.Error())
 			os.Exit(1)

@@ -14,8 +14,8 @@ import (
 	"net/http/httputil"
 	"time"
 
-	"xunfei-gateway/internal/config"
-	"xunfei-gateway/internal/routing"
+	"llm-gateway/internal/config"
+	"llm-gateway/internal/routing"
 )
 
 // NewTransport 构建到上游的 HTTP 传输层（连接池 + HTTP/2）。

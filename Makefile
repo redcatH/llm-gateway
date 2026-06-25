@@ -20,7 +20,7 @@ vet: ## 静态检查
 	go vet ./...
 
 docker: ## 构建 Docker 镜像
-	docker build -t xunfei-gateway:latest .
+	docker build -t llm-gateway:latest .
 
 clean: ## 清理构建产物
 	rm -rf bin/

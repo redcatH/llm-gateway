@@ -10,7 +10,7 @@ import (
 	"net/url"
 	"strings"
 
-	"xunfei-gateway/internal/routing"
+	"llm-gateway/internal/routing"
 )
 
 // hopByHopHeaders 是 RFC 7230 规定的逐跳头，转发响应时必须剥离

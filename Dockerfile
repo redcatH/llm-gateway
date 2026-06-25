@@ -1,5 +1,5 @@
 # =============================================================================
-# xunfei-gateway 多阶段 Dockerfile
+# llm-gateway 多阶段 Dockerfile
 # Stage 1: 构建 Go 二进制（零 CGO，静态链接）
 # Stage 2: 最小 alpine 运行镜像
 # =============================================================================
@@ -17,8 +17,8 @@ ENV CGO_ENABLED=0
 
 WORKDIR /src
 
-# 先拷 go.mod 利用缓存（本项目零依赖，go.sum 可能不存在）。
-COPY go.mod ./
+# 先拷 go.mod + go.sum 利用缓存。
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .

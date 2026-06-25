@@ -44,9 +44,17 @@ type Config struct {
 	PreserveHost bool
 	// LogLevel 是 slog 日志级别。
 	LogLevel slog.Level
-	// LogDir 是日志文件目录。非空时同步写文件（按日期滚动，文件名如 2026-06-25.log）。
+	// LogDir 是日志文件目录。非空时同步写文件（lumberjack 按大小滚动 + 自动清理）。
 	// 为空则仅输出到 stdout。
 	LogDir string
+	// LogMaxSize 是单个日志文件的最大 MB 数，超过后自动滚动。默认 100。
+	LogMaxSize int
+	// LogMaxBackups 是保留的旧日志文件最大数量。默认 7。0 表示保留全部。
+	LogMaxBackups int
+	// LogMaxAge 是旧日志文件保留的最大天数。默认 0（不按天数清理，仅按数量）。
+	LogMaxAge int
+	// LogCompress 是否压缩旧日志文件（gzip）。默认 true。
+	LogCompress bool
 	// SSEInterceptEnabled 是否启用 SSE error 拦截。
 	// true 时对上游 200+SSE 响应做首帧 peek，命中规则则拦截；
 	// false 时全部走纯透传（不 peek）。
@@ -118,6 +126,10 @@ func Load() (*Config, error) {
 		PreserveHost:               envBool("PRESERVE_HOST", false),
 		LogLevel:                   envLevel("LOG_LEVEL", slog.LevelInfo),
 		LogDir:                     envString("LOG_DIR", ""),
+		LogMaxSize:                 envIntWithDefault("LOG_MAX_SIZE", 100),
+		LogMaxBackups:              envIntWithDefault("LOG_MAX_BACKUPS", 7),
+		LogMaxAge:                  envIntWithDefault("LOG_MAX_AGE", 0),
+		LogCompress:                envBool("LOG_COMPRESS", true),
 		SSEInterceptEnabled:        envBool("SSE_INTERCEPT_ENABLED", true),
 		SSERetryAfter:              retryAfter,
 	}, nil
@@ -173,6 +185,19 @@ func envInt(key string, def int) (int, error) {
 		return 0, fmt.Errorf("invalid int for %s=%q: %w", key, v, err)
 	}
 	return n, nil
+}
+
+// envIntWithDefault 解析环境变量为 int，未设置或非法时返回默认值（不报错）。
+func envIntWithDefault(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return def
+	}
+	return n
 }
 
 func envDuration(key string, def time.Duration) (time.Duration, error) {
