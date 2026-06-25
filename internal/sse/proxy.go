@@ -8,10 +8,15 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 
 	"llm-gateway/internal/routing"
 )
+
+// codeInMessage 匹配 message 字符串里的 "code: NNNN"（讯飞把真实错误码嵌在文案里）。
+var codeInMessage = regexp.MustCompile(`code:\s*(\d+)`)
 
 // hopByHopHeaders 是 RFC 7230 规定的逐跳头，转发响应时必须剥离
 // （与 httputil.ReverseProxy 行为一致，属协议强制，非内容变更）。
@@ -227,6 +232,12 @@ func parseErrorPayload(payload []byte, eventType string) (Match, bool) {
 			case string:
 				// 字符串 code 不填 Match.Code，但 ErrorType 已有值可匹配。
 			}
+			// 讯飞 Anthropic 路径常把真实 code 藏在 message 字符串里
+			// （如 "...code: 10012, msg: ..."），error 对象无结构化 code 字段。
+			// 此时从 message 回填 code，使现有按 code 匹配的规则能命中。
+			if m.Code == 0 {
+				m.Code = extractCodeFromMessage(m.Message)
+			}
 			return m, true
 		}
 	}
@@ -329,4 +340,19 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	w.WriteHeader(status)
 	body, _ := json.Marshal(map[string]string{"error": msg})
 	_, _ = w.Write(body)
+}
+
+// extractCodeFromMessage 从 message 字符串里提取 "code: NNNN" 的数字部分。
+// 讯飞 Anthropic 路径把真实错误码嵌在文案里（error 对象无结构化 code 字段），
+// 此处回填以便按 code 匹配的规则能命中。未匹配返回 0。
+func extractCodeFromMessage(msg string) int {
+	m := codeInMessage.FindStringSubmatch(msg)
+	if len(m) < 2 {
+		return 0
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0
+	}
+	return n
 }

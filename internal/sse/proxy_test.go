@@ -73,6 +73,18 @@ func TestProxyHandler(t *testing.T) {
 			wantHeader:     "Retry-After",
 		},
 		{
+			// 讯飞 Anthropic 路径：error 对象无结构化 code，真实 code 10012 藏在 message 里。
+			// 期望从 message 回填 code 后命中 10012 规则 → 拦截 503。
+			name:           "xunfei_anthropic_code_in_message_intercepted_to_503",
+			upstreamStatus: http.StatusOK,
+			upstreamCT:     "text/event-stream",
+			upstreamBody:   "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"Xunfei claude request failed with Sid: cht000dd27a@dx code: 10012, msg: EngineInternalError:1105|{\\\"Code\\\":1105,\\\"Message\\\":\\\"The system is busy, please try again later.\\\"}, timeStamp:17:50:17.382\",\"type\":\"api_error\"}}\n\n",
+			wantStatus:     http.StatusServiceUnavailable,
+			wantBodyHas:    "upstream engine busy",
+			wantBodyNotHas: "EngineInternalError",
+			wantHeader:     "Retry-After",
+		},
+		{
 			// Anthropic 格式但 error_type 不在规则中 → 透传。
 			name:           "anthropic_unruled_passthrough",
 			upstreamStatus: http.StatusOK,
