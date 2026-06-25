@@ -1,0 +1,43 @@
+# llm-gateway — docker-compose
+#
+# 用法：
+#   1. 准备上游地址（任选）：
+#        - 写到项目根目录的 .env 文件（已被 .gitignore 忽略，安全），或
+#        - export 到宿主 shell：
+#            export UPSTREAM_OPENAI_URL=https://api.openai.com
+#            export UPSTREAM_ANTHROPIC_URL=https://api.anthropic.com
+#      两者都缺省时回退到 UPSTREAM_URL。
+#   2. docker compose up -d --build
+#   3. curl http://localhost:8080/health
+#
+# 镜像来源：
+#   - 默认本地构建（下方 build:）。
+#   - 改用 GHCR 发布镜像：注释掉 build: 段，启用下方 image: 行。
+
+services:
+  llm-gateway:
+    build:
+      context: .
+    # image: ghcr.io/redcath/llm-gateway:latest
+    container_name: llm-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # 按协议分流到不同上游；两者都缺省时回退到 UPSTREAM_URL。
+      UPSTREAM_URL: ${UPSTREAM_URL:-}
+      UPSTREAM_OPENAI_URL: ${UPSTREAM_OPENAI_URL:-}
+      UPSTREAM_ANTHROPIC_URL: ${UPSTREAM_ANTHROPIC_URL:-}
+      LISTEN_ADDR: ":8080"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # 文件日志：写入下方挂载卷，按大小滚动。
+      LOG_DIR: /app/logs
+      LOG_MAX_SIZE: ${LOG_MAX_SIZE:-100}
+      LOG_MAX_BACKUPS: ${LOG_MAX_BACKUPS:-7}
+      LOG_COMPRESS: ${LOG_COMPRESS:-true}
+      # SSE error 拦截：命中规则返回 503 + Retry-After，客户端 SDK 自动重试。
+      SSE_INTERCEPT_ENABLED: ${SSE_INTERCEPT_ENABLED:-true}
+      SSE_RETRY_AFTER: ${SSE_RETRY_AFTER:-5}
+    volumes:
+      # 容器以非 root(uid 1000) 运行；若启动报日志目录权限错误：chown -R 1000:1000 ./logs
+      - ./logs:/app/logs
