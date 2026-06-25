@@ -62,6 +62,26 @@ func TestProxyHandler(t *testing.T) {
 			wantHeader:     "Retry-After",
 		},
 		{
+			// Anthropic 格式：event: error + {"type":"error","error":{"type":"overloaded_error",...}}
+			name:           "anthropic_overloaded_intercepted_to_503",
+			upstreamStatus: http.StatusOK,
+			upstreamCT:     "text/event-stream",
+			upstreamBody:   "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Anthropic upstream is overloaded\"}}\n\n",
+			wantStatus:     http.StatusServiceUnavailable,
+			wantBodyHas:    "upstream engine busy",
+			wantBodyNotHas: "overloaded_error",
+			wantHeader:     "Retry-After",
+		},
+		{
+			// Anthropic 格式但 error_type 不在规则中 → 透传。
+			name:           "anthropic_unruled_passthrough",
+			upstreamStatus: http.StatusOK,
+			upstreamCT:     "text/event-stream",
+			upstreamBody:   "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n",
+			wantStatus:     http.StatusOK,
+			wantBodyExact:  "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n",
+		},
+		{
 			// 10300 未配置规则 → 仍透传，证明只拦已知 code。
 			name:           "10300_unruled_passthrough",
 			upstreamStatus: http.StatusOK,
@@ -96,6 +116,9 @@ func TestProxyHandler(t *testing.T) {
 		},
 	}
 
+	// DefaultRules 已含 overloaded_error 规则。
+	rules := DefaultRules(5)
+
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -106,8 +129,7 @@ func TestProxyHandler(t *testing.T) {
 			defer upstream.Close()
 
 			target, _ := url.Parse(upstream.URL)
-			// openai 与 anthropic 指向同一 mock，聚焦验证拦截/透传逻辑（路由在 TestProxyHandlerRouting 验证）。
-			h := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), slog.Default())
+			h := ProxyHandler(target, target, false, http.DefaultTransport, rules, slog.Default())
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"stream":true}`))
@@ -175,7 +197,7 @@ func TestProxyHandlerRouting(t *testing.T) {
 	}
 }
 
-// TestRuleMatches 验证规则的 code + 多子串 AND 匹配。
+// TestRuleMatches 验证规则的 code + ErrorType + 多子串 AND 匹配。
 func TestRuleMatches(t *testing.T) {
 	// 多子串 AND：必须同时含 "EngineInternalError" 与 "1105"。
 	rule := Rule{Code: 10012, MsgContains: []string{"EngineInternalError", "1105"}}
@@ -204,21 +226,39 @@ func TestRuleMatches(t *testing.T) {
 	if !wildcard.matches(Match{Code: 1, Message: "anything"}) {
 		t.Error("wildcard rule should match any error")
 	}
+
+	// ErrorType 匹配。
+	etRule := Rule{ErrorType: "overloaded_error"}
+	if !etRule.matches(Match{ErrorType: "overloaded_error", Message: "busy"}) {
+		t.Error("ErrorType match should hit")
+	}
+	if etRule.matches(Match{ErrorType: "invalid_request_error", Message: "bad"}) {
+		t.Error("ErrorType mismatch should not hit")
+	}
 }
 
-// TestParseErrorEvent 验证从 SSE 事件字节解析 error 帧。
+// TestParseErrorEvent 验证从 SSE 事件字节解析 error 帧（OpenAI + Anthropic 格式）。
 func TestParseErrorEvent(t *testing.T) {
 	cases := []struct {
-		name     string
-		event    string
-		wantOK   bool
-		wantCode int
+		name        string
+		event       string
+		wantOK      bool
+		wantCode    int
+		wantErrType string
+		wantMsgHas  string
 	}{
-		{"numeric_code", "data: {\"error\":{\"code\":10012,\"message\":\"busy\"}}\n\n", true, 10012},
-		{"event_line_with_data", "event: error\ndata: {\"error\":{\"code\":10012,\"message\":\"x\"}}\n\n", true, 10012},
-		{"choices_not_error", "data: {\"choices\":[{\"delta\":{}}]}\n\n", false, 0},
-		{"done_marker", "data: [DONE]\n\n", false, 0},
-		{"comment_only", ": keepalive\n\n", false, 0},
+		// OpenAI 格式
+		{"openai_numeric_code", "data: {\"error\":{\"code\":10012,\"message\":\"busy\"}}\n\n", true, 10012, "", "busy"},
+		{"openai_with_event_line", "event: error\ndata: {\"error\":{\"code\":10012,\"message\":\"x\"}}\n\n", true, 10012, "", "x"},
+		// Anthropic 格式
+		{"anthropic_overloaded", "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n", true, 0, "overloaded_error", "overloaded"},
+		{"anthropic_rate_limit", "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"too many\"}}\n\n", true, 0, "rate_limit_error", "too many"},
+		{"anthropic_with_numeric_code", "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"code\":10012,\"message\":\"xunfei busy\"}}\n\n", true, 10012, "api_error", "xunfei busy"},
+		// 非 error 帧
+		{"choices_not_error", "data: {\"choices\":[{\"delta\":{}}]}\n\n", false, 0, "", ""},
+		{"done_marker", "data: [DONE]\n\n", false, 0, "", ""},
+		{"comment_only", ": keepalive\n\n", false, 0, "", ""},
+		{"anthropic_message_start", "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n", false, 0, "", ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -226,8 +266,17 @@ func TestParseErrorEvent(t *testing.T) {
 			if ok != c.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, c.wantOK)
 			}
-			if ok && m.Code != c.wantCode {
+			if !ok {
+				return
+			}
+			if m.Code != c.wantCode {
 				t.Errorf("code = %d, want %d", m.Code, c.wantCode)
+			}
+			if m.ErrorType != c.wantErrType {
+				t.Errorf("errorType = %q, want %q", m.ErrorType, c.wantErrType)
+			}
+			if c.wantMsgHas != "" && !strings.Contains(m.Message, c.wantMsgHas) {
+				t.Errorf("message = %q, want contains %q", m.Message, c.wantMsgHas)
 			}
 		})
 	}

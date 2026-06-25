@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"xunfei-gateway/internal/config"
+	"xunfei-gateway/internal/logdir"
 	"xunfei-gateway/internal/proxy"
 	"xunfei-gateway/internal/server"
 	"xunfei-gateway/internal/sse"
@@ -28,9 +29,30 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: cfg.LogLevel,
-	}))
+	handlerOpts := &slog.HandlerOptions{Level: cfg.LogLevel}
+
+	// stdout handler（始终启用）。
+	stdoutHandler := slog.NewTextHandler(os.Stdout, handlerOpts)
+
+	// 组装 logger：有 LOG_DIR 时同时写文件；否则仅 stdout。
+	var logger *slog.Logger
+	var fileHandler *logdir.Handler
+	if cfg.LogDir != "" {
+		if err := os.MkdirAll(cfg.LogDir, 0755); err != nil {
+			slog.Error("cannot create log dir", "dir", cfg.LogDir, "err", err.Error())
+			os.Exit(1)
+		}
+		var err error
+		fileHandler, err = logdir.New(cfg.LogDir, handlerOpts)
+		if err != nil {
+			slog.Error("cannot open log file", "dir", cfg.LogDir, "err", err.Error())
+			os.Exit(1)
+		}
+		defer fileHandler.Close()
+		logger = slog.New(logdir.MultiHandler(stdoutHandler, fileHandler))
+	} else {
+		logger = slog.New(stdoutHandler)
+	}
 	slog.SetDefault(logger)
 
 	// 共享 Transport：ReverseProxy 与 sse.ProxyHandler 复用同一连接池。

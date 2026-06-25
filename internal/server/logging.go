@@ -3,9 +3,11 @@ package server
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"time"
 )
 
@@ -60,10 +62,36 @@ func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 // loggingMiddleware 记录每个请求的访问日志（method/path/status/bytes/耗时）。
 // 它只读取元信息，不修改请求或响应内容，不影响透传透明性。
+//
+// 两个诊断要点：
+//   - 请求开始即打 debug 日志：流式请求若 hang/panic，结束日志不会出现，
+//     至少能看到请求已到达，区分"没到网关"与"到了但卡住"。
+//   - recover 兜底：Go net/http 默认不 recover，handler panic 会拖死整个进程
+//     （表现为客户端 ConnectionRefused + 无结构化日志）。此处捕获后记 Error + 返回 500。
 func loggingMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		logger.Debug("request start",
+			"method", r.Method,
+			"path", r.URL.Path,
+			"remote", r.RemoteAddr,
+		)
 		rec := &statusRecorder{ResponseWriter: w}
+		defer func() {
+			if rcv := recover(); rcv != nil {
+				logger.Error("panic recovered",
+					"method", r.Method,
+					"path", r.URL.Path,
+					"panic", fmt.Sprint(rcv),
+					"stack", string(debug.Stack()),
+					"duration_ms", time.Since(start).Milliseconds(),
+				)
+				// 仅在尚未写过响应头时补 500；流式中途崩溃则连接已破，不再写。
+				if rec.status == 0 {
+					http.Error(rec, "internal server error", http.StatusInternalServerError)
+				}
+			}
+		}()
 		next.ServeHTTP(rec, r)
 
 		logger.Info("request",

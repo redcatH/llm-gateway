@@ -38,6 +38,12 @@ func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, tra
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// 按请求协议（路径）选上游：/v1/messages → Anthropic，其余 → OpenAI。
 		target := routing.SelectTarget(req, openAITarget, anthropicTarget)
+		logger.Debug("incoming request",
+			"method", req.Method,
+			"path", req.URL.Path,
+			"target_host", target.Host,
+			"accept", req.Header.Get("Accept"),
+		)
 		outReq := buildUpstreamRequest(req, target, preserveHost)
 
 		resp, err := transport.RoundTrip(outReq)
@@ -47,6 +53,12 @@ func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, tra
 			return
 		}
 		defer resp.Body.Close()
+
+		logger.Debug("upstream response",
+			"path", req.URL.Path,
+			"status", resp.StatusCode,
+			"content_type", resp.Header.Get("Content-Type"),
+		)
 
 		// 仅对 200 + SSE 响应做 peek 拦截；其余原样透传。
 		if resp.StatusCode == http.StatusOK && isSSEResponse(resp) {
@@ -62,8 +74,16 @@ func handleSSEResponse(w http.ResponseWriter, resp *http.Response, rules []Rule,
 	br := bufio.NewReader(resp.Body)
 	peeked, err := readFirstEvent(br)
 
-	// 解析首帧是否 error 帧。
-	if m, ok := parseErrorEvent(peeked); ok {
+	m, isErr := parseErrorEvent(peeked)
+	logger.Debug("sse first event peeked",
+		"path", req.URL.Path,
+		"bytes", len(peeked),
+		"is_error_frame", isErr,
+		"code", m.Code,
+	)
+
+	// 解析首帧是 error 帧时尝试匹配规则。
+	if isErr {
 		matched := false
 		for _, rule := range rules {
 			if rule.matches(m) {
@@ -103,7 +123,7 @@ func handleSSEResponse(w http.ResponseWriter, resp *http.Response, rules []Rule,
 
 	// 读取异常时仅记日志，仍尽力放行已读字节（保守不吞流）。
 	if err != nil && err != io.EOF {
-		logger.Warn("peek first sse event ended with error, passing through", "err", err.Error())
+		logger.Warn("peek first sse event ended with error, passing through", "err", err.Error(), "path", req.URL.Path)
 	}
 	forwardStream(w, resp, peeked, br)
 }
@@ -152,14 +172,21 @@ func readFirstEvent(br *bufio.Reader) ([]byte, error) {
 }
 
 // parseErrorEvent 从一个 SSE 事件字节中解析 error 帧。
-// 识别 data: 行，提取 JSON 中的 error.code 与 error.message。
-// 返回 (Match, true) 若是 error 帧；否则 (Match{}, false)。
+// 同时支持两种协议格式：
 //
-// 注意：code 用 json.RawMessage 接收以兼容数字（讯飞 10012）与字符串两种形态，
-// 数字形态会解析到 Match.Code；字符串形态时 Code 为 0（仍可按 message 匹配）。
+//	OpenAI:    data: {"error":{"code":10012,"message":"..."}}
+//	Anthropic: event: error \n data: {"type":"error","error":{"type":"overloaded_error","message":"..."}}
+//
+// 返回 (Match, true) 若是 error 帧；否则 (Match{}, false)。
 func parseErrorEvent(event []byte) (Match, bool) {
+	var eventType string
 	for _, raw := range bytes.Split(event, []byte("\n")) {
 		line := bytes.TrimSpace(raw)
+		// 提取 event: 行（Anthropic 协议用 event: error 标识错误帧）。
+		if bytes.HasPrefix(line, []byte("event:")) {
+			eventType = strings.TrimSpace(string(bytes.TrimPrefix(line, []byte("event:"))))
+			continue
+		}
 		if !bytes.HasPrefix(line, []byte("data:")) {
 			continue
 		}
@@ -167,27 +194,63 @@ func parseErrorEvent(event []byte) (Match, bool) {
 		if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
 			continue
 		}
-		var obj struct {
-			Error struct {
-				Code    json.RawMessage `json:"code"`
-				Message string          `json:"message"`
-			} `json:"error"`
+		m, ok := parseErrorPayload(payload, eventType)
+		if ok {
+			return m, true
 		}
-		if err := json.Unmarshal(payload, &obj); err != nil {
-			continue
-		}
-		// 存在 error.code 或 error.message 即视为 error 帧。
-		if len(obj.Error.Code) == 0 && obj.Error.Message == "" {
-			continue
-		}
-		m := Match{Message: obj.Error.Message, Raw: payload}
-		var codeInt int
-		if json.Unmarshal(obj.Error.Code, &codeInt) == nil {
-			m.Code = codeInt
-		}
-		return m, true
 	}
 	return Match{}, false
+}
+
+// parseErrorPayload 从 data 行的 JSON payload 中解析 error。
+// eventType 为 SSE event: 行的值（Anthropic 协议为 "error"，OpenAI 协议为空）。
+func parseErrorPayload(payload []byte, eventType string) (Match, bool) {
+	// Anthropic 格式：{"type":"error","error":{"type":"overloaded_error","message":"..."}}
+	var anthropic struct {
+		Type  string `json:"type"`
+		Error struct {
+			Type    string `json:"type"`
+			Code    any    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &anthropic); err == nil {
+		if anthropic.Type == "error" && (anthropic.Error.Type != "" || anthropic.Error.Message != "") {
+			m := Match{
+				ErrorType: anthropic.Error.Type,
+				Message:   anthropic.Error.Message,
+				Raw:       payload,
+			}
+			// error.code 可能是数字或字符串。
+			switch v := anthropic.Error.Code.(type) {
+			case float64:
+				m.Code = int(v)
+			case string:
+				// 字符串 code 不填 Match.Code，但 ErrorType 已有值可匹配。
+			}
+			return m, true
+		}
+	}
+
+	// OpenAI 格式：{"error":{"code":10012,"message":"..."}}
+	var openai struct {
+		Error struct {
+			Code    json.RawMessage `json:"code"`
+			Message string          `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(payload, &openai); err != nil {
+		return Match{}, false
+	}
+	if len(openai.Error.Code) == 0 && openai.Error.Message == "" {
+		return Match{}, false
+	}
+	m := Match{Message: openai.Error.Message, Raw: payload}
+	var codeInt int
+	if json.Unmarshal(openai.Error.Code, &codeInt) == nil {
+		m.Code = codeInt
+	}
+	return m, true
 }
 
 // isSSEResponse 判断上游响应是否为 SSE 流。

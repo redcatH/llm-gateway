@@ -47,6 +47,11 @@ func DefaultRules(retryAfter int) []Rule {
 			MsgContains: []string{"NotEnoughCvError"},
 			Handler:     retryableHandler(retryAfter),
 		},
+		{
+			// Anthropic overloaded_error —— 上游过载，客户端应重试。
+			ErrorType: "overloaded_error",
+			Handler:   retryableHandler(retryAfter),
+		},
 	}
 }
 

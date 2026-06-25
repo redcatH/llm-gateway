@@ -44,6 +44,9 @@ type Config struct {
 	PreserveHost bool
 	// LogLevel 是 slog 日志级别。
 	LogLevel slog.Level
+	// LogDir 是日志文件目录。非空时同步写文件（按日期滚动，文件名如 2026-06-25.log）。
+	// 为空则仅输出到 stdout。
+	LogDir string
 	// SSEInterceptEnabled 是否启用 SSE error 拦截。
 	// true 时对上游 200+SSE 响应做首帧 peek，命中规则则拦截；
 	// false 时全部走纯透传（不 peek）。
@@ -114,6 +117,7 @@ func Load() (*Config, error) {
 		UpstreamInsecureSkipVerify: envBool("UPSTREAM_INSECURE_SKIP_VERIFY", false),
 		PreserveHost:               envBool("PRESERVE_HOST", false),
 		LogLevel:                   envLevel("LOG_LEVEL", slog.LevelInfo),
+		LogDir:                     envString("LOG_DIR", ""),
 		SSEInterceptEnabled:        envBool("SSE_INTERCEPT_ENABLED", true),
 		SSERetryAfter:              retryAfter,
 	}, nil

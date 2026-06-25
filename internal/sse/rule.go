@@ -11,6 +11,9 @@ import "strings"
 type Match struct {
 	// Code 是 error.code（讯飞为数字，如 10012）。
 	Code int
+	// ErrorType 是 error.type（Anthropic 协议，如 "overloaded_error"）。
+	// OpenAI 协议通常为空。
+	ErrorType string
 	// Message 是 error.message 原文。
 	Message string
 	// Raw 是该 data 帧的原始 JSON 字节，供日志/调试。
@@ -22,6 +25,8 @@ type Match struct {
 type Rule struct {
 	// Code 匹配 error.code；0 表示任意 code。
 	Code int
+	// ErrorType 匹配 error.type（Anthropic 协议）；空表示任意 type。
+	ErrorType string
 	// MsgContains 是子串匹配列表，AND 语义：error.message 必须同时包含全部子串才命中。
 	// 空切片表示任意 message（仅按 Code 匹配）。配置多个子串可提高匹配准确性，避免误匹配。
 	MsgContains []string
@@ -30,9 +35,13 @@ type Rule struct {
 }
 
 // matches 判断一个 error 是否命中本规则。
-// Code 需匹配（0 表示任意），且 MsgContains 中所有子串都必须出现在 message 中（AND 语义）。
+// Code 需匹配（0 表示任意），ErrorType 需匹配（空表示任意），
+// 且 MsgContains 中所有子串都必须出现在 message 中（AND 语义）。
 func (r Rule) matches(m Match) bool {
 	if r.Code != 0 && r.Code != m.Code {
+		return false
+	}
+	if r.ErrorType != "" && r.ErrorType != m.ErrorType {
 		return false
 	}
 	for _, sub := range r.MsgContains {
