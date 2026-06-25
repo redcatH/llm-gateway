@@ -52,6 +52,17 @@ func TestProxyHandler(t *testing.T) {
 			wantHeader:     "Retry-After",
 		},
 		{
+			// 真实线上日志：10110 ServiceIsBusyError:Engine Busy，应拦截为 503。
+			name:           "10110_service_is_busy_intercepted_to_503",
+			upstreamStatus: http.StatusOK,
+			upstreamCT:     "text/event-stream",
+			upstreamBody:   `data: {"error":{"code":10110,"message":"Xunfei request failed with Sid: cht000e7eef@dx19efa253ca2ba60322 code: 10110, msg: ServiceIsBusyError:Engine Busy, timeStamp:23:00:05.958"}}` + "\n\n",
+			wantStatus:     http.StatusServiceUnavailable,
+			wantBodyHas:    "upstream engine busy",
+			wantBodyNotHas: "ServiceIsBusyError",
+			wantHeader:     "Retry-After",
+		},
+		{
 			name:           "11210_not_enough_cv_intercepted_to_503",
 			upstreamStatus: http.StatusOK,
 			upstreamCT:     "text/event-stream",

@@ -42,6 +42,13 @@ func DefaultRules(retryAfter int) []Rule {
 			Handler:     retryableHandler(retryAfter),
 		},
 		{
+			// 10110 ServiceIsBusyError:Engine Busy —— 服务忙，临时性可重试。
+			// 与 10010 同属"引擎忙"，但错误码/错误名不同，单独成条。
+			Code:        10110,
+			MsgContains: []string{"ServiceIsBusyError", "Engine Busy"},
+			Handler:     retryableHandler(retryAfter),
+		},
+		{
 			// 11210 NotEnoughCvError —— 并发/容量不足，退避后重试。
 			Code:        11210,
 			MsgContains: []string{"NotEnoughCvError"},
