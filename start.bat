@@ -2,8 +2,6 @@
 chcp 65001 >nul 2>&1
 
 :: -- Upstream URLs (fallback: UPSTREAM_OPENAI/ANTHROPIC_URL default to UPSTREAM_URL)
-set UPSTREAM_OPENAI_URL=https://your-upstream.example.com/v2/
-set UPSTREAM_ANTHROPIC_URL=https://your-upstream.example.com/anthropic
 if "%UPSTREAM_URL%"=="" (
     set UPSTREAM_URL=https://your-upstream.example.com
 )
