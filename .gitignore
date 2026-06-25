@@ -9,6 +9,7 @@
 # 本地环境配置（含密钥，禁止提交）
 .env
 .env.*
+!.env.example
 
 # 编辑器/IDE
 .idea/
