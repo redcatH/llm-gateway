@@ -66,7 +66,7 @@ func main() {
 	var handler http.Handler
 	if cfg.SSEInterceptEnabled {
 		rules := sse.DefaultRules(cfg.SSERetryAfter)
-		handler = sse.ProxyHandler(cfg.OpenAITarget, cfg.AnthropicTarget, cfg.PreserveHost, transport, rules, logger)
+		handler = sse.ProxyHandler(cfg.OpenAITarget, cfg.AnthropicTarget, cfg.PreserveHost, transport, rules, logger, cfg.LogDir)
 	} else {
 		handler = proxy.New(cfg, transport, logger)
 	}

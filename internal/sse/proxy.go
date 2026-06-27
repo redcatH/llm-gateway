@@ -8,9 +8,12 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"llm-gateway/internal/routing"
 )
@@ -39,7 +42,7 @@ var hopByHopHeaders = []string{
 //
 // 分流依据是上游响应（resp.StatusCode==200 且 Content-Type 含 text/event-stream），
 // 而非请求的 Accept 头，更可靠。
-func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, transport http.RoundTripper, rules []Rule, logger *slog.Logger) http.Handler {
+func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, transport http.RoundTripper, rules []Rule, logger *slog.Logger, logDir string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// 按请求协议（路径）选上游：/v1/messages → Anthropic，其余 → OpenAI。
 		target := routing.SelectTarget(req, openAITarget, anthropicTarget)
@@ -49,6 +52,15 @@ func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, tra
 			"target_host", target.Host,
 			"accept", req.Header.Get("Accept"),
 		)
+
+		// 缓存请求体用于 error 诊断；重置 req.Body 为可重读 reader，保证转发不受影响。
+		// 必须在 RoundTrip 前：req.Clone() 浅拷贝 Body，RoundTrip 会消费掉原始 reader。
+		var reqBody []byte
+		if req.Body != nil {
+			reqBody, _ = io.ReadAll(req.Body)
+			req.Body = io.NopCloser(bytes.NewReader(reqBody))
+		}
+
 		outReq := buildUpstreamRequest(req, target, preserveHost)
 
 		resp, err := transport.RoundTrip(outReq)
@@ -67,7 +79,7 @@ func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, tra
 
 		// 仅对 200 + SSE 响应做 peek 拦截；其余原样透传。
 		if resp.StatusCode == http.StatusOK && isSSEResponse(resp) {
-			handleSSEResponse(w, resp, rules, logger, req)
+			handleSSEResponse(w, resp, rules, logger, req, reqBody, logDir)
 			return
 		}
 		copyResponse(w, resp)
@@ -75,7 +87,7 @@ func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, tra
 }
 
 // handleSSEResponse 处理 200 + SSE 响应：peek 首帧，命中规则则拦截，否则放行续传。
-func handleSSEResponse(w http.ResponseWriter, resp *http.Response, rules []Rule, logger *slog.Logger, req *http.Request) {
+func handleSSEResponse(w http.ResponseWriter, resp *http.Response, rules []Rule, logger *slog.Logger, req *http.Request, reqBody []byte, logDir string) {
 	br := bufio.NewReader(resp.Body)
 	peeked, err := readFirstEvent(br)
 
@@ -122,7 +134,13 @@ func handleSSEResponse(w http.ResponseWriter, resp *http.Response, rules []Rule,
 				"msg", m.Message,
 				"raw", string(m.Raw),
 				"path", req.URL.Path,
+				"request_id", req.Header.Get("X-Request-Id"),
 			)
+			// 客服反馈的"孤立 tool 消息"类错误（10012 EngineInternalError:Bad Request）：
+			// 转储完整请求体到独立文件，便于事后排查 messages 异常。结果仍照常透传。
+			if is10012BadRequest(m) {
+				dumpRequestBody(logDir, dumpFileName(req, time.Now()), reqBody, logger)
+			}
 		}
 	}
 
@@ -369,4 +387,51 @@ func extractCodeFromMessage(msg string) int {
 		return 0
 	}
 	return n
+}
+
+// is10012BadRequest 判断是否为客服反馈的"孤立 tool 消息"类错误：
+// code==10012 且 message 同时含 "EngineInternalError" 与 "Bad Request"。
+// （1105 子类型已被 DefaultRules 拦截不进 !matched；此处精确匹配 Bad Request 子类型。）
+func is10012BadRequest(m Match) bool {
+	return m.Code == 10012 &&
+		strings.Contains(m.Message, "EngineInternalError") &&
+		strings.Contains(m.Message, "Bad Request")
+}
+
+// dumpFileName 决定转储文件名（不含扩展名）：
+// 优先用客户端传入的 X-Request-Id（filepath.Base 防路径穿越）；否则用毫秒精度时间戳。
+// 不修改下游请求、不注入任何 header——仅读取已存在的 X-Request-Id。
+func dumpFileName(req *http.Request, now time.Time) string {
+	if id := strings.TrimSpace(req.Header.Get("X-Request-Id")); id != "" {
+		return filepath.Base(id) // 不可信输入 → 仅取文件名部分，防穿越
+	}
+	return now.UTC().Format("20060102T150405.000Z") // 毫秒精度，文件系统安全，字典序=时间序
+}
+
+// dumpRequestBody 把请求体完整写入 LOG_DIR/requests/<name>.json，不截断。
+// logDir 为空（未配置日志目录）则跳过；失败仅记日志，不影响透传。
+func dumpRequestBody(logDir, name string, body []byte, logger *slog.Logger) {
+	if logDir == "" || name == "" || len(body) == 0 {
+		return
+	}
+	dir := filepath.Join(logDir, "requests")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		logger.Warn("dump request body: mkdir failed", "err", err.Error())
+		return
+	}
+	path := filepath.Join(dir, name+".json")
+	// 防覆盖：文件已存在时追加 -N（N 从 2 递增）直到找到不存在的文件名。
+	// ponytail: stat+write 间存在 TOCTOU 竞态，诊断文件并发概率极低，可接受。
+	for i := 2; ; i++ {
+		if _, err := os.Stat(path); err == nil {
+			path = filepath.Join(dir, name+"-"+strconv.Itoa(i)+".json")
+			continue
+		}
+		break
+	}
+	if err := os.WriteFile(path, body, 0o644); err != nil {
+		logger.Warn("dump request body: write failed", "err", err.Error(), "file", path)
+		return
+	}
+	logger.Info("dumped request body for unmatched 10012", "file", path, "bytes", len(body))
 }

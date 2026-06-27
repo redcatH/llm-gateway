@@ -6,8 +6,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestProxyHandler 用 httptest.Server 模拟上游，表驱动覆盖拦截与透传各场景。
@@ -152,7 +155,7 @@ func TestProxyHandler(t *testing.T) {
 			defer upstream.Close()
 
 			target, _ := url.Parse(upstream.URL)
-			h := ProxyHandler(target, target, false, http.DefaultTransport, rules, slog.Default())
+			h := ProxyHandler(target, target, false, http.DefaultTransport, rules, slog.Default(), "")
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"stream":true}`))
@@ -197,7 +200,7 @@ func TestProxyHandlerRouting(t *testing.T) {
 
 	openaiURL, _ := url.Parse(openai.URL)
 	anthropicURL, _ := url.Parse(anthropic.URL)
-	h := ProxyHandler(openaiURL, anthropicURL, false, http.DefaultTransport, DefaultRules(5), slog.Default())
+	h := ProxyHandler(openaiURL, anthropicURL, false, http.DefaultTransport, DefaultRules(5), slog.Default(), "")
 
 	cases := []struct {
 		path    string
@@ -301,6 +304,170 @@ func TestParseErrorEvent(t *testing.T) {
 			if c.wantMsgHas != "" && !strings.Contains(m.Message, c.wantMsgHas) {
 				t.Errorf("message = %q, want contains %q", m.Message, c.wantMsgHas)
 			}
+		})
+	}
+}
+
+// TestDumpFileName 验证转储文件名：优先 X-Request-Id（filepath.Base 防穿越），否则毫秒时间戳。
+func TestDumpFileName(t *testing.T) {
+	now := time.Date(2026, 6, 27, 12, 20, 49, 989000000, time.UTC)
+
+	cases := []struct {
+		name   string
+		header string // X-Request-Id 值；空表示不设置
+		want   string
+	}{
+		{name: "uses_x_request_id", header: "abc-123", want: "abc-123"},
+		{name: "trims_whitespace", header: "  abc-123  ", want: "abc-123"},
+		{name: "path_traversal_sanitized", header: "../../etc/passwd", want: "passwd"},
+		{name: "timestamp_when_absent", header: "", want: "20260627T122049.989Z"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			if c.header != "" {
+				req.Header.Set("X-Request-Id", c.header)
+			}
+			if got := dumpFileName(req, now); got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestIs10012BadRequest 验证仅 10012 + EngineInternalError:Bad Request 命中。
+func TestIs10012BadRequest(t *testing.T) {
+	cases := []struct {
+		name string
+		m    Match
+		want bool
+	}{
+		{"bad_request_subtype", Match{Code: 10012, Message: "code: 10012, msg: EngineInternalError:Bad Request, timeStamp:00:00:00"}, true},
+		{"1105_subtype", Match{Code: 10012, Message: "EngineInternalError:1105"}, false},
+		{"other_subtype", Match{Code: 10012, Message: "EngineInternalError:Other"}, false},
+		{"missing_engine_error", Match{Code: 10012, Message: "Bad Request"}, false},
+		{"wrong_code", Match{Code: 10010, Message: "EngineInternalError:Bad Request"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := is10012BadRequest(c.m); got != c.want {
+				t.Errorf("got %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestDumpRequestBody 验证转储与防覆盖（同名追加 -N）。
+func TestDumpRequestBody(t *testing.T) {
+	dir := t.TempDir()
+
+	dumpRequestBody(dir, "req-1", []byte(`{"a":1}`), slog.Default())
+	dumpRequestBody(dir, "req-1", []byte(`{"b":2}`), slog.Default()) // 同名 → req-1-2.json
+
+	first, err := os.ReadFile(filepath.Join(dir, "requests", "req-1.json"))
+	if err != nil {
+		t.Fatalf("expected req-1.json: %v", err)
+	}
+	if string(first) != `{"a":1}` {
+		t.Errorf("first = %q, want {\"a\":1}", string(first))
+	}
+
+	second, err := os.ReadFile(filepath.Join(dir, "requests", "req-1-2.json"))
+	if err != nil {
+		t.Fatalf("expected req-1-2.json (collision suffix): %v", err)
+	}
+	if string(second) != `{"b":2}` {
+		t.Errorf("second = %q, want {\"b\":2}", string(second))
+	}
+
+	// 空 logDir / 空 body → 跳过，不报错。
+	dumpRequestBody("", "req-1", []byte(`{"c":3}`), slog.Default())
+	dumpRequestBody(dir, "req-empty", nil, slog.Default())
+	if _, err := os.Stat(filepath.Join(dir, "requests", "req-empty.json")); !os.IsNotExist(err) {
+		t.Errorf("empty body should not produce a file")
+	}
+}
+
+// TestUnmatched10012DumpsRequestBody 端到端：10012 Bad Request 时转储完整请求体，响应仍透传。
+func TestUnmatched10012DumpsRequestBody(t *testing.T) {
+	upstreamBody := `data: {"error":{"code":10012,"message":"Xunfei request failed with Sid: x@dx code: 10012, msg: EngineInternalError:Bad Request, timeStamp:00:00:00"}}` + "\n\n"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer upstream.Close()
+
+	dir := t.TempDir()
+	target, _ := url.Parse(upstream.URL)
+	h := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), slog.Default(), dir)
+
+	reqBody := `{"messages":[{"role":"tool","tool_call_id":"x","content":"r"}]}`
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("X-Request-Id", "test-req-1")
+	h.ServeHTTP(rec, req)
+
+	// 行为不变：200 透传，字节级一致。
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.String() != upstreamBody {
+		t.Errorf("body not byte-exact\ngot:  %q\nwant: %q", rec.Body.String(), upstreamBody)
+	}
+
+	// dump 文件存在且内容 == 原始请求体（完整未截断）。
+	dumped, err := os.ReadFile(filepath.Join(dir, "requests", "test-req-1.json"))
+	if err != nil {
+		t.Fatalf("expected dump file: %v", err)
+	}
+	if string(dumped) != reqBody {
+		t.Errorf("dumped body = %q, want %q", string(dumped), reqBody)
+	}
+}
+
+// TestNoDumpWhenNot10012BadRequest 验证非目标错误不产生 dump 文件。
+func TestNoDumpWhenNot10012BadRequest(t *testing.T) {
+	cases := []struct {
+		name         string
+		upstreamBody string
+	}{
+		{
+			// 1105 子类型被规则拦截 → 走 matched，不进 dump 分支。
+			name:         "10012_1105_intercepted",
+			upstreamBody: `data: {"error":{"code":10012,"message":"Xunfei ... EngineInternalError:1105|{\"Code\":1105}"}}` + "\n\n",
+		},
+		{
+			// 其他 10012 子类型，落 !matched 但不命中 is10012BadRequest → 不 dump。
+			name:         "10012_other_subtype_unmatched",
+			upstreamBody: `data: {"error":{"code":10012,"message":"Xunfei ... EngineInternalError:Other, timeStamp:00:00:00"}}` + "\n\n",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, c.upstreamBody)
+			}))
+			defer upstream.Close()
+
+			dir := t.TempDir()
+			target, _ := url.Parse(upstream.URL)
+			h := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), slog.Default(), dir)
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[]}`))
+			req.Header.Set("X-Request-Id", "should-not-dump")
+			h.ServeHTTP(rec, req)
+
+			entries, err := os.ReadDir(filepath.Join(dir, "requests"))
+			if err == nil && len(entries) > 0 {
+				t.Errorf("expected no dump files, got %d", len(entries))
+			}
+			// 目录不存在（从未写）也算通过。
 		})
 	}
 }
