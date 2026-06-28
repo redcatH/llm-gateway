@@ -55,10 +55,40 @@ func DefaultRules(retryAfter int) []Rule {
 			Handler:     retryableHandler(retryAfter),
 		},
 		{
+			// 10012 EngineInternalError + model_context_window_exceeded —— 上下文超长，
+			// 客户端错误，不可重试。返回 400 + context_length_exceeded 让客户端 SDK 正确处理。
+			Code:        10012,
+			MsgContains: []string{"EngineInternalError", "model_context_window_exceeded"},
+			Handler:     contextExceededHandler(),
+		},
+		{
 			// Anthropic overloaded_error —— 上游过载，客户端应重试。
 			ErrorType: "overloaded_error",
 			Handler:   retryableHandler(retryAfter),
 		},
+	}
+}
+
+// contextExceededHandler 返回一个 Handler：拦截并返回 400 + context_length_exceeded。
+// 上下文超长是客户端错误，不可重试；返回标准 OpenAI 错误格式让客户端 SDK 正确处理。
+func contextExceededHandler() Handler {
+	return func(req *http.Request, m Match) Decision {
+		body, _ := json.Marshal(map[string]any{
+			"error": map[string]any{
+				"message": "context length exceeded, reduce input tokens and retry",
+				"type":    "invalid_request_error",
+				"param":   nil,
+				"code":    "context_length_exceeded",
+			},
+		})
+		h := http.Header{}
+		h.Set("Content-Type", "application/json")
+		return Decision{
+			Intercept: true,
+			Status:    http.StatusBadRequest, // 400
+			Body:      body,
+			Headers:   h,
+		}
 	}
 }
 

@@ -99,6 +99,16 @@ func TestProxyHandler(t *testing.T) {
 			wantHeader:     "Retry-After",
 		},
 		{
+			// 10012 + model_context_window_exceeded → 拦截为 400 + context_length_exceeded。
+			name:           "10012_context_window_exceeded_intercepted_to_400",
+			upstreamStatus: http.StatusOK,
+			upstreamCT:     "text/event-stream",
+			upstreamBody:   `data: {"error":{"code":10012,"message":"Xunfei request failed with Sid: cht000d99f7@dx19f0dd14b94ba5b432 code: 10012, msg: EngineInternalError:error, status code: 400, status: 400 Bad Request, message: provider error: finish_reason=model_context_window_exceeded, timeStamp:18:40:51.623"}}` + "\n\n",
+			wantStatus:     http.StatusBadRequest,
+			wantBodyHas:    "context_length_exceeded",
+			wantBodyNotHas: "EngineInternalError",
+		},
+		{
 			// Anthropic 格式但 error_type 不在规则中 → 透传。
 			name:           "anthropic_unruled_passthrough",
 			upstreamStatus: http.StatusOK,
