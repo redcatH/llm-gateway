@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 )
 
 // Decision 是 Handler 对命中 error 的处理决策。
@@ -62,6 +63,14 @@ func DefaultRules(retryAfter int) []Rule {
 			Handler:     contextExceededHandler(),
 		},
 		{
+			// 10012 EngineInternalError + unsupported content type —— 模型不支持该内容类型
+			// （如纯文本模型收到 image_url），客户端错误，不可重试。
+			// 返回 400 + invalid_request_error，按请求路径区分 OpenAI/Anthropic 格式。
+			Code:        10012,
+			MsgContains: []string{"EngineInternalError", "unsupported content type"},
+			Handler:     unsupportedContentTypeHandler(),
+		},
+		{
 			// Anthropic overloaded_error —— 上游过载，客户端应重试。
 			ErrorType: "overloaded_error",
 			Handler:   retryableHandler(retryAfter),
@@ -70,26 +79,74 @@ func DefaultRules(retryAfter int) []Rule {
 }
 
 // contextExceededHandler 返回一个 Handler：拦截并返回 400 + context_length_exceeded。
-// 上下文超长是客户端错误，不可重试；返回标准 OpenAI 错误格式让客户端 SDK 正确处理。
+// 上下文超长是客户端错误，不可重试；按请求路径返回 OpenAI 或 Anthropic 标准错误格式。
 func contextExceededHandler() Handler {
 	return func(req *http.Request, m Match) Decision {
-		body, _ := json.Marshal(map[string]any{
-			"error": map[string]any{
-				"message": "context length exceeded, reduce input tokens and retry",
-				"type":    "invalid_request_error",
-				"param":   nil,
-				"code":    "context_length_exceeded",
-			},
-		})
-		h := http.Header{}
-		h.Set("Content-Type", "application/json")
+		const msg = "context length exceeded, reduce input tokens and retry"
 		return Decision{
 			Intercept: true,
-			Status:    http.StatusBadRequest, // 400
-			Body:      body,
-			Headers:   h,
+			Status:    http.StatusBadRequest,
+			Body:      formatBadRequest(req, msg, "context_length_exceeded"),
+			Headers:   jsonHeader(),
 		}
 	}
+}
+
+// unsupportedContentTypeHandler 返回一个 Handler：拦截并返回 400 + invalid_request_error。
+// 模型不支持该内容类型（如纯文本模型收到 image_url），客户端错误，不可重试。
+// 按请求路径返回 OpenAI 或 Anthropic 标准错误格式。
+func unsupportedContentTypeHandler() Handler {
+	return func(req *http.Request, m Match) Decision {
+		const msg = "model does not support this content type, only text is allowed"
+		return Decision{
+			Intercept: true,
+			Status:    http.StatusBadRequest,
+			Body:      formatBadRequest(req, msg, ""),
+			Headers:   jsonHeader(),
+		}
+	}
+}
+
+// formatBadRequest 按请求路径返回 OpenAI 或 Anthropic 格式的 400 错误体。
+// 路径含 /v1/messages → Anthropic 格式；其余 → OpenAI 格式。
+// code 为空时 OpenAI 格式不设 code 字段（null）。
+func formatBadRequest(req *http.Request, message, code string) []byte {
+	if strings.Contains(req.URL.Path, "/v1/messages") {
+		// Anthropic 格式
+		body, _ := json.Marshal(map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "invalid_request_error",
+				"message": message,
+			},
+		})
+		return body
+	}
+	// OpenAI 格式
+	body, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"message": message,
+			"type":    "invalid_request_error",
+			"param":   nil,
+			"code":    stringOrNil(code),
+		},
+	})
+	return body
+}
+
+// stringOrNil 返回非空字符串，空字符串返回 nil（JSON 序列化为 null）。
+func stringOrNil(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// jsonHeader 返回 Content-Type: application/json 的 Header。
+func jsonHeader() http.Header {
+	h := http.Header{}
+	h.Set("Content-Type", "application/json")
+	return h
 }
 
 // retryableHandler 返回一个 Handler：拦截并返回 503 + Retry-After + JSON error。

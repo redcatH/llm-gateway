@@ -1,6 +1,7 @@
 package sse
 
 import (
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -99,13 +100,23 @@ func TestProxyHandler(t *testing.T) {
 			wantHeader:     "Retry-After",
 		},
 		{
-			// 10012 + model_context_window_exceeded → 拦截为 400 + context_length_exceeded。
+			// 10012 + model_context_window_exceeded → 拦截为 400 + context_length_exceeded（OpenAI 路径）。
 			name:           "10012_context_window_exceeded_intercepted_to_400",
 			upstreamStatus: http.StatusOK,
 			upstreamCT:     "text/event-stream",
 			upstreamBody:   `data: {"error":{"code":10012,"message":"Xunfei request failed with Sid: cht000d99f7@dx19f0dd14b94ba5b432 code: 10012, msg: EngineInternalError:error, status code: 400, status: 400 Bad Request, message: provider error: finish_reason=model_context_window_exceeded, timeStamp:18:40:51.623"}}` + "\n\n",
 			wantStatus:     http.StatusBadRequest,
 			wantBodyHas:    "context_length_exceeded",
+			wantBodyNotHas: "EngineInternalError",
+		},
+		{
+			// 10012 + unsupported content type → 拦截为 400 + invalid_request_error（OpenAI 路径）。
+			name:           "10012_unsupported_content_type_intercepted_to_400",
+			upstreamStatus: http.StatusOK,
+			upstreamCT:     "text/event-stream",
+			upstreamBody:   `data: {"error":{"code":10012,"message":"Xunfei request failed with Sid: cht000ddd8e@dx19f0e187211b958312 code: 10012, msg: EngineInternalError:error, status code: 400, status: 400 Bad Request, message: invalid character 'd' looking for beginning of value, body: data:{\"error\":{\"code\":\"ModelArts.81001\",\"message\":\"Inference failed: request param validation error, Value error, message[90].content[0] has unsupported content type: 'image_url', only supported type(s): 'text'.\"}}, timeStamp:19:58:32.528"}}` + "\n\n",
+			wantStatus:     http.StatusBadRequest,
+			wantBodyHas:    "only text is allowed",
 			wantBodyNotHas: "EngineInternalError",
 		},
 		{
@@ -480,4 +491,148 @@ func TestNoDumpWhenNot10012BadRequest(t *testing.T) {
 			// 目录不存在（从未写）也算通过。
 		})
 	}
+}
+
+// TestBadRequestFormatByProtocol 验证 400 错误按请求路径返回 OpenAI 或 Anthropic 格式。
+func TestBadRequestFormatByProtocol(t *testing.T) {
+	rules := DefaultRules(5)
+
+	cases := []struct {
+		name         string
+		path         string
+		upstreamBody string
+		wantBodyHas  string // body 应包含的子串
+		wantBodyNot  string // body 不应包含的子串
+	}{
+		{
+			// context_window_exceeded + Anthropic 路径 → Anthropic 格式
+			name:         "context_exceeded_anthropic_format",
+			path:         "/v1/messages",
+			upstreamBody: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Xunfei claude request failed with Sid: x@dx code: 10012, msg: EngineInternalError:error, message: provider error: finish_reason=model_context_window_exceeded, timeStamp:00:00:00\"}}\n\n",
+			wantBodyHas:  "\"type\":\"error\"",
+			wantBodyNot:  "\"param\"",
+		},
+		{
+			// unsupported content type + Anthropic 路径 → Anthropic 格式
+			name:         "unsupported_content_type_anthropic_format",
+			path:         "/v1/messages",
+			upstreamBody: "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Xunfei claude request failed with Sid: x@dx code: 10012, msg: EngineInternalError:error, message: unsupported content type: 'image_url', only supported type(s): 'text'.\"}}\n\n",
+			wantBodyHas:  "\"type\":\"error\"",
+			wantBodyNot:  "\"param\"",
+		},
+		{
+			// context_window_exceeded + OpenAI 路径 → OpenAI 格式
+			name:         "context_exceeded_openai_format",
+			path:         "/v1/chat/completions",
+			upstreamBody: `data: {"error":{"code":10012,"message":"Xunfei ... EngineInternalError:error, message: finish_reason=model_context_window_exceeded, timeStamp:00:00:00"}}` + "\n\n",
+			wantBodyHas:  "\"param\":null",
+			wantBodyNot:  "\"type\":\"error\"",
+		},
+		{
+			// unsupported content type + OpenAI 路径 → OpenAI 格式
+			name:         "unsupported_content_type_openai_format",
+			path:         "/v1/chat/completions",
+			upstreamBody: `data: {"error":{"code":10012,"message":"Xunfei ... EngineInternalError:error, message: unsupported content type: 'image_url', only supported type(s): 'text'."}}` + "\n\n",
+			wantBodyHas:  "\"param\":null",
+			wantBodyNot:  "\"type\":\"error\"",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, c.upstreamBody)
+			}))
+			defer upstream.Close()
+
+			target, _ := url.Parse(upstream.URL)
+			h := ProxyHandler(target, target, false, http.DefaultTransport, rules, slog.Default(), "")
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, c.path, strings.NewReader(`{}`))
+			req.Header.Set("Accept", "text/event-stream")
+			h.ServeHTTP(rec, req)
+
+			body := rec.Body.String()
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%q", rec.Code, body)
+			}
+			if !strings.Contains(body, c.wantBodyHas) {
+				t.Errorf("body missing %q; got %q", c.wantBodyHas, body)
+			}
+			if strings.Contains(body, c.wantBodyNot) {
+				t.Errorf("body should not contain %q; got %q", c.wantBodyNot, body)
+			}
+			// 所有 400 拦截都应含 invalid_request_error
+			if !strings.Contains(body, "invalid_request_error") {
+				t.Errorf("body missing 'invalid_request_error'; got %q", body)
+			}
+		})
+	}
+}
+
+// TestFormatBadRequest 验证 formatBadRequest 对不同路径返回正确的 JSON 结构。
+func TestFormatBadRequest(t *testing.T) {
+	t.Run("openai_path", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		body := formatBadRequest(req, "test message", "test_code")
+		var parsed map[string]any
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		errObj := parsed["error"].(map[string]any)
+		if errObj["type"] != "invalid_request_error" {
+			t.Errorf("type = %v, want invalid_request_error", errObj["type"])
+		}
+		if errObj["message"] != "test message" {
+			t.Errorf("message = %v, want 'test message'", errObj["message"])
+		}
+		if errObj["code"] != "test_code" {
+			t.Errorf("code = %v, want 'test_code'", errObj["code"])
+		}
+		if errObj["param"] != nil {
+			t.Errorf("param = %v, want nil", errObj["param"])
+		}
+	})
+
+	t.Run("anthropic_path", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+		body := formatBadRequest(req, "test message", "ignored")
+		var parsed map[string]any
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if parsed["type"] != "error" {
+			t.Errorf("outer type = %v, want 'error'", parsed["type"])
+		}
+		errObj := parsed["error"].(map[string]any)
+		if errObj["type"] != "invalid_request_error" {
+			t.Errorf("type = %v, want invalid_request_error", errObj["type"])
+		}
+		if errObj["message"] != "test message" {
+			t.Errorf("message = %v, want 'test message'", errObj["message"])
+		}
+		// Anthropic 格式不应有 param/code 字段
+		if _, ok := errObj["param"]; ok {
+			t.Error("Anthropic format should not have 'param' field")
+		}
+		if _, ok := errObj["code"]; ok {
+			t.Error("Anthropic format should not have 'code' field")
+		}
+	})
+
+	t.Run("empty_code_serializes_null", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		body := formatBadRequest(req, "msg", "")
+		var parsed map[string]any
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		errObj := parsed["error"].(map[string]any)
+		if errObj["code"] != nil {
+			t.Errorf("empty code should serialize as null, got %v", errObj["code"])
+		}
+	})
 }
