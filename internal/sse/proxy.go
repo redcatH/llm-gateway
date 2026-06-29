@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"llm-gateway/internal/contextrouting"
 	"llm-gateway/internal/routing"
 )
 
@@ -34,7 +35,10 @@ var hopByHopHeaders = []string{
 	"Upgrade",
 }
 
-// ProxyHandler 返回一个处理所有请求的 http.Handler。
+// pickTarget 决定本次请求的上游、是否走 1M 鉴权替换、以及 1M token。
+type pickTarget func(req *http.Request, reqBody []byte) (target *url.URL, is1M bool, token1M string)
+
+// ProxyHandler 返回一个处理所有请求的 http.Handler（无上下文路由，纯按协议选上游）。
 //
 // 对上游响应为 200 + SSE 的请求做首帧 peek：
 //   - 首帧命中拦截规则 → 按 Handler 决策响应（如 503），丢弃原流；
@@ -43,17 +47,45 @@ var hopByHopHeaders = []string{
 // 分流依据是上游响应（resp.StatusCode==200 且 Content-Type 含 text/event-stream），
 // 而非请求的 Accept 头，更可靠。
 func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, transport http.RoundTripper, rules []Rule, logger *slog.Logger, logDir string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		// 按请求协议（路径）选上游：/v1/messages → Anthropic，其余 → OpenAI。
-		target := routing.SelectTarget(req, openAITarget, anthropicTarget)
-		logger.Debug("incoming request",
-			"method", req.Method,
-			"path", req.URL.Path,
-			"target_host", target.Host,
-			"accept", req.Header.Get("Accept"),
-		)
+	pick := func(req *http.Request, _ []byte) (*url.URL, bool, string) {
+		return routing.SelectTarget(req, openAITarget, anthropicTarget), false, ""
+	}
+	return serveProxy(pick, preserveHost, transport, rules, logger, logDir)
+}
 
-		// 缓存请求体用于 error 诊断；重置 req.Body 为可重读 reader，保证转发不受影响。
+// ProxyHandlerWithRouting 返回带上下文路由的 http.Handler。
+// 仅当请求 model 为 500k 模型且估算 input token >= 阈值时，自动切换到 1M 上游
+// 并用配置的固定 token 替换出站 Authorization。其余请求走 500k 默认透传。
+func ProxyHandlerWithRouting(router *contextrouting.Router, preserveHost bool, transport http.RoundTripper, rules []Rule, logger *slog.Logger, logDir string) http.Handler {
+	pick := func(req *http.Request, reqBody []byte) (*url.URL, bool, string) {
+		d := router.Decide(req.URL.Path, reqBody)
+		logger.Debug("context routing decision",
+			"path", req.URL.Path,
+			"route", d.RouteLabel(),
+			"est_tokens", d.Tokens,
+			"threshold", router.Threshold,
+			"reason", d.Reason,
+		)
+		if d.Is1M {
+			logger.Info("routed to 1m upstream",
+				"path", req.URL.Path, "est_tokens", d.Tokens, "threshold", router.Threshold,
+			)
+		}
+		if d.Reason == "no_1m_target" || d.Reason == "no_token" {
+			logger.Warn("token routing cannot upgrade",
+				"path", req.URL.Path, "reason", d.Reason, "est_tokens", d.Tokens,
+			)
+		}
+		return d.Target, d.Is1M, router.Token1M
+	}
+	return serveProxy(pick, preserveHost, transport, rules, logger, logDir)
+}
+
+// serveProxy 是 ProxyHandler / ProxyHandlerWithRouting 的共享实现。
+// pick 在读 body 后调用，决定上游目标、是否 1M、1M token。
+func serveProxy(pick pickTarget, preserveHost bool, transport http.RoundTripper, rules []Rule, logger *slog.Logger, logDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, req *http.Request) {
+		// 缓存请求体用于 error 诊断 + token 估算；重置 req.Body 为可重读 reader，保证转发不受影响。
 		// 必须在 RoundTrip 前：req.Clone() 浅拷贝 Body，RoundTrip 会消费掉原始 reader。
 		var reqBody []byte
 		if req.Body != nil {
@@ -61,7 +93,30 @@ func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, tra
 			req.Body = io.NopCloser(bytes.NewReader(reqBody))
 		}
 
+		// 按路径 + 估算 token 选上游（500k 默认 / 1M 升级）。
+		target, is1M, token1M := pick(req, reqBody)
+
+		logger.Debug("incoming request",
+			"method", req.Method,
+			"path", req.URL.Path,
+			"target_host", target.Host,
+			"route", func() string {
+				if is1M {
+					return "1m"
+				}
+				return "500k"
+			}(),
+			"accept", req.Header.Get("Accept"),
+		)
+
 		outReq := buildUpstreamRequest(req, target, preserveHost)
+
+		// 仅 1M 路由：用配置的固定 token 覆盖出站鉴权头。
+		// 500k 路由完全不碰 header → 透明透传不变。
+		// ⚠️ 这是透明透传原则的有意例外，仅限 1M 分支（见 README）。
+		if is1M {
+			apply1MAuth(outReq, token1M)
+		}
 
 		resp, err := transport.RoundTrip(outReq)
 		if err != nil {
@@ -83,7 +138,13 @@ func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, tra
 			return
 		}
 		copyResponse(w, resp)
-	})
+	}
+}
+
+// apply1MAuth 用 1M 固定 token 覆盖出站请求的鉴权头。
+// 讯飞 1M(glm-5.2) 上游两协议端点统一用 Authorization: Bearer <token>。
+func apply1MAuth(outReq *http.Request, token string) {
+	outReq.Header.Set("Authorization", "Bearer "+token)
 }
 
 // handleSSEResponse 处理 200 + SSE 响应：peek 首帧，命中规则则拦截，否则放行续传。

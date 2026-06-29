@@ -28,6 +28,14 @@ type Config struct {
 	// AnthropicTarget 是解析后的 Anthropic 路由目标（UpstreamAnthropicURL ?? UpstreamURL），必非空。
 	AnthropicTarget *url.URL
 
+	// ── 上下文路由(500k/1M 自动切换) ──
+	OpenAI1MTarget    *url.URL // 1M(glm-5.2) OpenAI 上游，可选
+	Anthropic1MTarget *url.URL // 1M Anthropic 上游，可选
+	Upstream1MToken   string   // 1M 固定鉴权 token；空=无法升级
+	ContextTokenThreshold int   // 触发升级的 input token 阈值(默认 450000)
+	TokenRoutingEnabled  bool  // 上下文路由开关；auto=1M token 非空且至少配一个 1M URL
+	RoutingModel500k     string // 触发判定的 500k model 名(默认 xopglm52)
+
 	// ListenAddr 是网关监听地址，如 ":8080"。
 	ListenAddr string
 	// ReadHeaderTimeout 限制读取请求头的最长时间，用于防御慢速攻击。
@@ -78,6 +86,25 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// 1M 上下文路由配置（可选）
+	openai1M, err := parseUpstreamURL("UPSTREAM_OPENAI_1M_URL")
+	if err != nil {
+		return nil, err
+	}
+	anthropic1M, err := parseUpstreamURL("UPSTREAM_ANTHROPIC_1M_URL")
+	if err != nil {
+		return nil, err
+	}
+	token1M := envString("UPSTREAM_1M_TOKEN", "")
+	threshold, err := envInt("CONTEXT_TOKEN_THRESHOLD", 450000)
+	if err != nil {
+		return nil, err
+	}
+	if threshold <= 0 {
+		return nil, fmt.Errorf("CONTEXT_TOKEN_THRESHOLD must be positive, got %d", threshold)
+	}
+	routingModel500k := envString("ROUTING_MODEL_500K", "xopglm52")
 
 	// 协议专用上游未配置时回退到默认上游。
 	openaiTarget := openaiURL
@@ -132,6 +159,13 @@ func Load() (*Config, error) {
 		LogCompress:                envBool("LOG_COMPRESS", true),
 		SSEInterceptEnabled:        envBool("SSE_INTERCEPT_ENABLED", true),
 		SSERetryAfter:              retryAfter,
+		// 上下文路由
+		OpenAI1MTarget:       openai1M,
+		Anthropic1MTarget:    anthropic1M,
+		Upstream1MToken:      token1M,
+		ContextTokenThreshold: threshold,
+		TokenRoutingEnabled:  envBool("TOKEN_ROUTING_ENABLED", token1M != "" && (openai1M != nil || anthropic1M != nil)),
+		RoutingModel500k:     routingModel500k,
 	}, nil
 }
 

@@ -11,10 +11,15 @@ import (
 	"strings"
 )
 
+// IsAnthropicPath 判断路径是否为 Anthropic 协议（含 /v1/messages）。
+func IsAnthropicPath(path string) bool {
+	return strings.Contains(path, "/v1/messages")
+}
+
 // SelectTarget 按请求路径在上游 openAI 与 anthropic 之间选择。
 // 路径含 "/v1/messages" → anthropic；否则 → openai。
 func SelectTarget(req *http.Request, openAI, anthropic *url.URL) *url.URL {
-	if strings.Contains(req.URL.Path, "/v1/messages") {
+	if IsAnthropicPath(req.URL.Path) {
 		return anthropic
 	}
 	return openAI

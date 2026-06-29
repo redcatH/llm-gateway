@@ -9,16 +9,19 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"llm-gateway/internal/config"
+	"llm-gateway/internal/contextrouting"
 	"llm-gateway/internal/logdir"
 	"llm-gateway/internal/proxy"
 	"llm-gateway/internal/server"
 	"llm-gateway/internal/sse"
+	"llm-gateway/internal/tokencount"
 )
 
 func main() {
@@ -66,7 +69,22 @@ func main() {
 	var handler http.Handler
 	if cfg.SSEInterceptEnabled {
 		rules := sse.DefaultRules(cfg.SSERetryAfter)
-		handler = sse.ProxyHandler(cfg.OpenAITarget, cfg.AnthropicTarget, cfg.PreserveHost, transport, rules, logger, cfg.LogDir)
+		if cfg.TokenRoutingEnabled {
+			router := &contextrouting.Router{
+				OpenAI500k:      cfg.OpenAITarget,
+				Anthropic500k:   cfg.AnthropicTarget,
+				OpenAI1M:        cfg.OpenAI1MTarget,
+				Anthropic1M:     cfg.Anthropic1MTarget,
+				Token1M:         cfg.Upstream1MToken,
+				Threshold:       cfg.ContextTokenThreshold,
+				Enabled:         true,
+				RoutingModel500k: cfg.RoutingModel500k,
+				Estimator:       tokencount.ApproxEstimator{},
+			}
+			handler = sse.ProxyHandlerWithRouting(router, cfg.PreserveHost, transport, rules, logger, cfg.LogDir)
+		} else {
+			handler = sse.ProxyHandler(cfg.OpenAITarget, cfg.AnthropicTarget, cfg.PreserveHost, transport, rules, logger, cfg.LogDir)
+		}
 	} else {
 		handler = proxy.New(cfg, transport, logger)
 	}
@@ -81,6 +99,17 @@ func main() {
 		"sse_intercept", cfg.SSEInterceptEnabled,
 		"max_idle_conns_per_host", cfg.MaxIdleConnsPerHost,
 	)
+	logger.Info("token routing status",
+		"enabled", cfg.TokenRoutingEnabled,
+		"threshold", cfg.ContextTokenThreshold,
+		"openai_1m", targetHost(cfg.OpenAI1MTarget),
+		"anthropic_1m", targetHost(cfg.Anthropic1MTarget),
+		"token_set", cfg.Upstream1MToken != "",
+		"model_500k", cfg.RoutingModel500k,
+	)
+	if cfg.TokenRoutingEnabled && cfg.Upstream1MToken == "" {
+		logger.Warn("token routing enabled but UPSTREAM_1M_TOKEN empty; will degrade to 500k")
+	}
 
 	// 在独立 goroutine 中监听，主 goroutine 等待退出信号。
 	serveErr := make(chan error, 1)
@@ -112,4 +141,12 @@ func main() {
 		os.Exit(1)
 	}
 	logger.Info("server stopped cleanly")
+}
+
+// targetHost 返回 URL 的 host 部分，nil 时返回 "unset"。
+func targetHost(u *url.URL) string {
+	if u == nil {
+		return "unset"
+	}
+	return u.Host
 }

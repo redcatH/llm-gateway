@@ -81,6 +81,23 @@
   强制要求，不属于"业务内容"。
 - 默认会追加 `X-Forwarded-For`（客户端 IP），这是标准代理行为，原头仍保留。
 - 请求体以 `io.Reader` 流式透传，不读入内存、不解析、不重序列化。
+- **唯一例外**：启用上下文路由时，升级到 1M 上游的请求会替换 `Authorization` 头（见下方）。
+
+## 上下文路由（500k / 1M）
+
+当配置了 1M 上下文模型（`glm-5.2`）的上游后，网关可自动在 500k 与 1M 之间路由：
+
+1. 仅当请求 body 的 `model` 为 500k 模型名（默认 `xopglm52`）时才介入，其他 model 一律走原透传。
+2. 估算请求的输入 token 数（近似：CJK 1字≈1 token，ASCII 3字符≈1 token，偏高留余量）。
+3. `估算 input >= CONTEXT_TOKEN_THRESHOLD`（默认 450000）→ 自动切换到 1M 上游 URL，并用配置的固定 token 替换 `Authorization`。
+4. 低于阈值 → 走 500k 默认上游，客户端鉴权原样透传。
+
+**设计原则**：宁可误升级到 1M（浪费一点），也不要漏判导致 500k 上游 `context_window_exceeded` 失败。
+
+> ⚠️ 1M 路由替换 `Authorization` 是透明透传原则的**唯一有意例外**，严格限定在 1M 分支。
+> 500k 路径字节级透明不变。此功能需要 `SSE_INTERCEPT_ENABLED=true`（默认）。
+
+未配置 1M URL/token 时，所有请求走 500k 默认上游，与无此功能时行为完全一致。
 
 ## 配置（环境变量）
 
@@ -103,6 +120,12 @@
 | `LOG_COMPRESS` | `true` | 是否 gzip 压缩旧日志 |
 | `SSE_INTERCEPT_ENABLED` | `true` | 是否启用 SSE error 拦截（关闭则纯透传） |
 | `SSE_RETRY_AFTER` | `5` | 拦截 503 响应的 `Retry-After` 秒数 |
+| `UPSTREAM_OPENAI_1M_URL` | — | 1M 上下文模型 OpenAI 协议上游（可选） |
+| `UPSTREAM_ANTHROPIC_1M_URL` | — | 1M 上下文模型 Anthropic 协议上游（可选） |
+| `UPSTREAM_1M_TOKEN` | — | 1M 上游固定鉴权 token（勿提交到仓库） |
+| `CONTEXT_TOKEN_THRESHOLD` | `450000` | 触发 1M 路由的输入 token 阈值 |
+| `TOKEN_ROUTING_ENABLED` | auto | 上下文路由开关；auto=1M token 非空且至少配一个 1M URL |
+| `ROUTING_MODEL_500K` | `xopglm52` | 触发路由判定的 500k 模型名 |
 
 ## 快速开始
 
@@ -222,9 +245,13 @@ hey -n 1000 -c 50 http://localhost:8080/anything
 ├── internal/
 │   ├── config/config.go           # 环境变量加载与校验
 │   ├── routing/routing.go         # 按路径选择 OpenAI / Anthropic 上游
+│   ├── contextrouting/router.go   # 500k/1M 上下文路由决策
+│   ├── tokencount/                # 输入 token 估算（可插拔 Estimator 接口）
+│   │   ├── estimator.go           # 近似估算器 + CJK/ASCII 系数
+│   │   └── extract.go             # OpenAI/Anthropic body 文本提取
 │   ├── proxy/proxy.go             # ReverseProxy 纯透传（拦截关闭时回退）
 │   ├── sse/
-│   │   ├── proxy.go               # SSE 首帧 peek + 拦截/透传
+│   │   ├── proxy.go               # SSE 首帧 peek + 拦截/透传 + 上下文路由
 │   │   ├── handler.go             # 命中决策（503 + Retry-After）+ DefaultRules
 │   │   └── rule.go                # 规则匹配（Code / ErrorType / MsgContains）
 │   ├── logdir/logdir.go           # 文件日志 handler（滚动 + stdout 多路输出）
