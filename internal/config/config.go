@@ -65,12 +65,6 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	if openaiURL == nil {
-		return nil, fmt.Errorf("no OpenAI upstream: set UPSTREAM_OPENAI_URL")
-	}
-	if anthropicURL == nil {
-		return nil, fmt.Errorf("no Anthropic upstream: set UPSTREAM_ANTHROPIC_URL")
-	}
 
 	readHeaderTimeout, err := envDuration("READ_HEADER_TIMEOUT", 10*time.Second)
 	if err != nil {
@@ -111,11 +105,11 @@ func Load() (*Config, error) {
 
 // ── 环境变量解析辅助函数 ──
 
-// parseUpstreamURL 解析一个可选的上游 URL 环境变量。未设置时返回 (nil, nil)。
+// parseUpstreamURL 解析一个必填的上游 URL 环境变量。未设置或格式非法时返回错误。
 func parseUpstreamURL(key string) (*url.URL, error) {
 	raw := os.Getenv(key)
 	if raw == "" {
-		return nil, nil
+		return nil, fmt.Errorf("%s is required", key)
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
