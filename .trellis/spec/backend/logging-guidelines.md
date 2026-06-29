@@ -30,7 +30,7 @@
 // ✅ 正确：结构化键值对
 logger.Info("starting transparent gateway",
     "listen", cfg.ListenAddr,
-    "upstream", cfg.UpstreamURL.String(),
+    "upstream_openai", cfg.OpenAITarget.String(),
 )
 
 // ❌ 错误：格式化字符串

@@ -2,7 +2,7 @@ APP      := gateway
 BIN      := bin/$(APP)
 PKG      := ./cmd/gateway
 
-# 默认上游用 httpbin.org 便于回显验证；生产部署请覆盖 UPSTREAM_URL。
+# 默认上游用 httpbin.org 便于回显验证；生产部署请覆盖两个协议上游。
 UPSTREAM ?= https://httpbin.org
 
 .PHONY: build run tidy vet docker clean help
@@ -11,7 +11,7 @@ build: ## 编译二进制到 bin/gateway
 	go build -trimpath -ldflags="-s -w" -o $(BIN) $(PKG)
 
 run: ## 以示例上游直接 go run
-	UPSTREAM_URL=$(UPSTREAM) LISTEN_ADDR=:8080 LOG_LEVEL=info go run $(PKG)
+	UPSTREAM_OPENAI_URL=$(UPSTREAM) UPSTREAM_ANTHROPIC_URL=$(UPSTREAM) LISTEN_ADDR=:8080 LOG_LEVEL=info go run $(PKG)
 
 tidy: ## 整理依赖
 	go mod tidy

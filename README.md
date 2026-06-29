@@ -12,7 +12,7 @@
 
 ## 核心特性
 
-- **双上游按协议路由**：OpenAI / Anthropic 协议分别指向独立上游，未配置时回退到统一 `UPSTREAM_URL`。
+- **双上游按协议路由**：OpenAI / Anthropic 协议分别指向独立上游，两者均必填，启动即校验。
 - **不改变原内容**：业务头与请求体字节级透传，不解析、不重序列化。
 - **SSE error 拦截**：上游返回 200 但 SSE 流内夹带 error 时，首帧 peek 命中规则即拦截为 503 + `Retry-After`，
   让 OpenAI/Anthropic SDK 自动重试；未命中则原样透传，不破坏流。
@@ -26,10 +26,10 @@
 
 | 请求路径 | 目标上游 |
 |---|---|
-| 含 `/v1/messages` | `UPSTREAM_ANTHROPIC_URL`（缺省回退 `UPSTREAM_URL`） |
-| 其余所有路径 | `UPSTREAM_OPENAI_URL`（缺省回退 `UPSTREAM_URL`） |
+| 含 `/v1/messages` | `UPSTREAM_ANTHROPIC_URL` |
+| 其余所有路径 | `UPSTREAM_OPENAI_URL` |
 
-至少需配置 `UPSTREAM_URL`，或同时配置两个协议专用上游。
+两个协议上游均必填，缺一启动即失败。
 
 ### 路径重写
 
@@ -86,9 +86,8 @@
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `UPSTREAM_URL` | — | 兜底默认上游；协议专用上游未配置时使用 |
-| `UPSTREAM_OPENAI_URL` | — | OpenAI 协议专用上游（可选，回退 `UPSTREAM_URL`） |
-| `UPSTREAM_ANTHROPIC_URL` | — | Anthropic 协议专用上游（可选，回退 `UPSTREAM_URL`） |
+| `UPSTREAM_OPENAI_URL` | — | OpenAI 协议上游（必填） |
+| `UPSTREAM_ANTHROPIC_URL` | — | Anthropic 协议上游（必填） |
 | `LISTEN_ADDR` | `:8080` | 监听地址 |
 | `READ_HEADER_TIMEOUT` | `10s` | 读头超时（防慢速攻击） |
 | `MAX_IDLE_CONNS_PER_HOST` | `100` | 到上游的每主机空闲连接数 |
@@ -128,14 +127,14 @@ curl http://localhost:8080/health
 # 用 httpbin 作上游，便于回显验证
 make run
 # 或直接
-UPSTREAM_URL=https://httpbin.org go run ./cmd/gateway
+UPSTREAM_OPENAI_URL=https://httpbin.org UPSTREAM_ANTHROPIC_URL=https://httpbin.org go run ./cmd/gateway
 ```
 
 ### 构建
 
 ```bash
 make build        # 产出 bin/gateway
-./bin/gateway     # 需提供 UPSTREAM_URL
+./bin/gateway     # 需提供 UPSTREAM_OPENAI_URL 与 UPSTREAM_ANTHROPIC_URL
 ```
 
 ### Docker

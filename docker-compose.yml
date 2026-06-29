@@ -1,12 +1,11 @@
 # llm-gateway — docker-compose
 #
 # 用法：
-#   1. 准备上游地址（任选）：
+#   1. 准备上游地址（两个协议上游均必填，任选载体）：
 #        - 写到项目根目录的 .env 文件（已被 .gitignore 忽略，安全），或
 #        - export 到宿主 shell：
 #            export UPSTREAM_OPENAI_URL=https://api.openai.com
 #            export UPSTREAM_ANTHROPIC_URL=https://api.anthropic.com
-#      两者都缺省时回退到 UPSTREAM_URL。
 #   2. docker compose up -d --build
 #   3. curl http://localhost:8080/health
 #
@@ -26,8 +25,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      # 按协议分流到不同上游；两者都缺省时回退到 UPSTREAM_URL。
-      UPSTREAM_URL: ${UPSTREAM_URL:-}
+      # 按协议分流到不同上游，两者均必填。
       UPSTREAM_OPENAI_URL: ${UPSTREAM_OPENAI_URL:-}
       UPSTREAM_ANTHROPIC_URL: ${UPSTREAM_ANTHROPIC_URL:-}
       LISTEN_ADDR: ":8080"

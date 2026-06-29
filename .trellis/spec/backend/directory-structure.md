@@ -48,7 +48,7 @@ xunfei-gateway/
 - 包名：小写单词，无下划线（`config`、`proxy`、`server`）。
 - 文件名：小写 + 下划线分隔（`logging.go`、`config.go`）。
 - 导出函数：大写开头，动词开头（`New`、`Load`）。
-- 环境变量：大写 + 下划线（`UPSTREAM_URL`、`LISTEN_ADDR`、`LOG_LEVEL`）。
+- 环境变量：大写 + 下划线（`UPSTREAM_OPENAI_URL`、`LISTEN_ADDR`、`LOG_LEVEL`）。
 - Go module 名：`xunfei-gateway`（连字符，非下划线）。
 
 ---

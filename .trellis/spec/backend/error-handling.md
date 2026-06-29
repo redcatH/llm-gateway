@@ -53,8 +53,8 @@ ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
 
 ```go
 // internal/config/config.go — 每个校验失败都给出可操作的提示
-if upstream.Scheme != "http" && upstream.Scheme != "https" {
-    return nil, fmt.Errorf("UPSTREAM_URL must use http or https scheme, got %q", upstream.Scheme)
+if u.Scheme != "http" && u.Scheme != "https" {
+    return nil, fmt.Errorf("%s must use http or https scheme, got %q", key, u.Scheme)
 }
 ```
 

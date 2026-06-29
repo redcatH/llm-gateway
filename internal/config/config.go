@@ -14,18 +14,9 @@ import (
 
 // Config 持有网关运行所需的全部配置，全部来自环境变量。
 type Config struct {
-	// UpstreamURL 是默认/兜底上游（向后兼容）。当未配置协议专用上游时使用。
-	// 可为 nil（此时 OpenAI/Anthropic 专用上游必须都配置）。
-	UpstreamURL *url.URL
-	// UpstreamOpenAIURL 是 OpenAI 协议（/v1/chat/completions 等）的专用上游（可选）。
-	// 未配置时回退到 UpstreamURL。
-	UpstreamOpenAIURL *url.URL
-	// UpstreamAnthropicURL 是 Anthropic 协议（/v1/messages）的专用上游（可选）。
-	// 未配置时回退到 UpstreamURL。
-	UpstreamAnthropicURL *url.URL
-	// OpenAITarget 是解析后的 OpenAI 路由目标（UpstreamOpenAIURL ?? UpstreamURL），必非空。
+	// OpenAITarget 是 OpenAI 协议（/v1/chat/completions 等）的路由目标，必填。
 	OpenAITarget *url.URL
-	// AnthropicTarget 是解析后的 Anthropic 路由目标（UpstreamAnthropicURL ?? UpstreamURL），必非空。
+	// AnthropicTarget 是 Anthropic 协议（/v1/messages）的路由目标，必填。
 	AnthropicTarget *url.URL
 
 	// ListenAddr 是网关监听地址，如 ":8080"。
@@ -66,10 +57,6 @@ type Config struct {
 // Load 从环境变量读取并校验配置。缺少必填项或格式非法时返回错误，
 // 调用方应据此在启动阶段直接退出。
 func Load() (*Config, error) {
-	upstreamURL, err := parseUpstreamURL("UPSTREAM_URL")
-	if err != nil {
-		return nil, err
-	}
 	openaiURL, err := parseUpstreamURL("UPSTREAM_OPENAI_URL")
 	if err != nil {
 		return nil, err
@@ -78,21 +65,11 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// 协议专用上游未配置时回退到默认上游。
-	openaiTarget := openaiURL
-	if openaiTarget == nil {
-		openaiTarget = upstreamURL
+	if openaiURL == nil {
+		return nil, fmt.Errorf("no OpenAI upstream: set UPSTREAM_OPENAI_URL")
 	}
-	anthropicTarget := anthropicURL
-	if anthropicTarget == nil {
-		anthropicTarget = upstreamURL
-	}
-	if openaiTarget == nil {
-		return nil, fmt.Errorf("no OpenAI upstream: set UPSTREAM_OPENAI_URL or UPSTREAM_URL")
-	}
-	if anthropicTarget == nil {
-		return nil, fmt.Errorf("no Anthropic upstream: set UPSTREAM_ANTHROPIC_URL or UPSTREAM_URL")
+	if anthropicURL == nil {
+		return nil, fmt.Errorf("no Anthropic upstream: set UPSTREAM_ANTHROPIC_URL")
 	}
 
 	readHeaderTimeout, err := envDuration("READ_HEADER_TIMEOUT", 10*time.Second)
@@ -113,11 +90,8 @@ func Load() (*Config, error) {
 	}
 
 	return &Config{
-		UpstreamURL:                upstreamURL,
-		UpstreamOpenAIURL:          openaiURL,
-		UpstreamAnthropicURL:       anthropicURL,
-		OpenAITarget:               openaiTarget,
-		AnthropicTarget:            anthropicTarget,
+		OpenAITarget:               openaiURL,
+		AnthropicTarget:            anthropicURL,
 		ListenAddr:                 envString("LISTEN_ADDR", ":8080"),
 		ReadHeaderTimeout:          readHeaderTimeout,
 		MaxIdleConnsPerHost:        maxIdle,
