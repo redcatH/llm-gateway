@@ -18,7 +18,7 @@
 | `debug` | 开发调试，生产环境关闭 | （当前未使用，预留） |
 | `info` | 正常业务事件 | 请求访问日志、服务启动/关闭 |
 | `warn` | 可恢复的异常情况 | （当前未使用，预留） |
-| `error` | 需要关注的故障 | 上游代理错误、服务启动失败 |
+| `error` | 需要关注的故障 | 上游代理错误、服务启动失败、上游 5xx 响应体诊断 |
 
 ---
 
@@ -56,6 +56,9 @@ logger.Info(fmt.Sprintf("starting on %s", cfg.ListenAddr))
 - 服务启动参数（监听地址、上游地址、关键配置）
 - 每个请求的访问日志（method/path/status/bytes/duration）
 - 上游代理错误（err/method/path）
+- 上游 5xx 响应体诊断：透明代理对上游 5xx 必须记录响应体才能定位真实错误
+  （如讯飞用 HTTP 500 包装的 1105 "system is busy"，不看 body 无法识别真实错误码）。
+  实现见 `internal/sse/proxy.go` 的 `logNonSuccessResponse`，约束见下方 "What NOT to Log" 例外。
 - 优雅关闭事件
 
 ---
@@ -65,6 +68,10 @@ logger.Info(fmt.Sprintf("starting on %s", cfg.ListenAddr))
 - ❌ 请求头中的 `Authorization`、`x-api-key` 等认证信息
 - ❌ 请求体内容（可能含用户对话数据）
 - ❌ 上游响应体内容
+  - **例外**：上游 5xx 异常诊断时，可记录截断后的响应体，约束如下：
+    - 仅 `status >= 500` 触发（4xx 属客户端错误，不记）；
+    - 截断上限 8KB（`maxLogBodyBytes`），超长标 `truncated=true` 并记原始 `body_bytes`；
+    - 不得包含认证头；body 读出后用 `NopCloser` 重置，保证透传字节级不变。
 - ❌ 客户端 IP 的完整追踪（仅 `X-Forwarded-For` 由代理自动处理）
 
 ---

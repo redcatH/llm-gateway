@@ -82,6 +82,12 @@ func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, tra
 			handleSSEResponse(w, resp, rules, logger, req, reqBody, logDir)
 			return
 		}
+		// 非流式 + 5xx → 记录响应体便于事后分析上游异常。
+		// 4xx 属客户端错误（如 401/404），不算上游异常，不记。
+		// 读全量 body 后重置 resp.Body，不影响后续透传。
+		if resp.StatusCode >= 500 {
+			logNonSuccessResponse(logger, req, resp)
+		}
 		copyResponse(w, resp)
 	})
 }
@@ -284,6 +290,43 @@ func parseErrorPayload(payload []byte, eventType string) (Match, bool) {
 // isSSEResponse 判断上游响应是否为 SSE 流。
 func isSSEResponse(resp *http.Response) bool {
 	return strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+}
+
+// logNonSuccessResponse 记录上游 5xx 响应的 body 内容，便于事后分析上游异常。
+// 读全量 body 后用 NopCloser 重置 resp.Body，保证后续 copyResponse 透传不受影响。
+// body 超过 maxLogBodyBytes 时截断并标注，防止超大响应撑爆日志。
+//
+// 遵循 logging-guidelines "What NOT to Log" 的 5xx 例外：
+// 仅 status>=500 触发、截断上限 8KB、不记认证头。详见 .trellis/spec/backend/logging-guidelines.md。
+func logNonSuccessResponse(logger *slog.Logger, req *http.Request, resp *http.Response) {
+	const maxLogBodyBytes = 8 * 1024 // 8KB 上限，足够覆盖上游错误体
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	// err 时 body 为已读部分，透传不中断；正常时为完整 body。
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil {
+		logger.Error("upstream non-success response (body read failed)",
+			"path", req.URL.Path,
+			"status", resp.StatusCode,
+			"content_type", resp.Header.Get("Content-Type"),
+			"read_err", err.Error(),
+		)
+		return
+	}
+
+	logBody := body
+	truncated := len(body) > maxLogBodyBytes
+	if truncated {
+		logBody = body[:maxLogBodyBytes]
+	}
+	logger.Error("upstream non-success response",
+		"path", req.URL.Path,
+		"status", resp.StatusCode,
+		"content_type", resp.Header.Get("Content-Type"),
+		"body", string(logBody),
+		"body_bytes", len(body),
+		"truncated", truncated,
+	)
 }
 
 // copyResponse 将上游响应原样透传给下游（status + header + body）。

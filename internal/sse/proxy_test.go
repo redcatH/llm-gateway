@@ -1,6 +1,7 @@
 package sse
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -282,6 +283,120 @@ func TestProxyHandlerRouting(t *testing.T) {
 				t.Errorf("path %s: body=%q, want contains %q", c.path, rec.Body.String(), c.wantHas)
 			}
 		})
+	}
+}
+
+// TestNonSuccessResponseLogged 验证 5xx 响应的 body 被记录到日志，且透传字节级不变。
+func TestNonSuccessResponseLogged(t *testing.T) {
+	var buf bytes.Buffer
+	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError})
+	logger := slog.New(h)
+
+	upstreamBody := `{"error":{"code":"10012","message":"xunfei response error: EngineInternalError:1105|The system is busy"}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	ph := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), logger, "")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+	ph.ServeHTTP(rec, req)
+
+	// 透传不变：500 + 原样 body。
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	if rec.Body.String() != upstreamBody {
+		t.Errorf("body not byte-exact\ngot:  %q\nwant: %q", rec.Body.String(), upstreamBody)
+	}
+
+	// 日志含 body 内容、status、path。
+	logOut := buf.String()
+	for _, want := range []string{
+		"upstream non-success response",
+		"status=500",
+		"/v1/chat/completions",
+		`EngineInternalError:1105`,
+		`The system is busy`,
+	} {
+		if !strings.Contains(logOut, want) {
+			t.Errorf("log missing %q\ngot: %s", want, logOut)
+		}
+	}
+}
+
+// Test4xxNotLogged 验证 4xx（客户端错误）不记日志，仍原样透传。
+func Test4xxNotLogged(t *testing.T) {
+	var buf bytes.Buffer
+	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError})
+	logger := slog.New(h)
+
+	upstreamBody := `{"error":{"message":"invalid api key"}}`
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized) // 401
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	ph := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), logger, "")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+	ph.ServeHTTP(rec, req)
+
+	// 透传不变。
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	if rec.Body.String() != upstreamBody {
+		t.Errorf("body not byte-exact\ngot:  %q\nwant: %q", rec.Body.String(), upstreamBody)
+	}
+	// 4xx 不应产生上游异常日志。
+	if strings.Contains(buf.String(), "upstream non-success response") {
+		t.Errorf("4xx should not be logged as upstream error; got: %s", buf.String())
+	}
+}
+
+// TestNonSuccessResponseTruncated 验证超大 body 被截断并标注 truncated=true。
+func TestNonSuccessResponseTruncated(t *testing.T) {
+	var buf bytes.Buffer
+	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError})
+	logger := slog.New(h)
+
+	// 16KB body，超过 8KB 上限。
+	big := strings.Repeat("x", 16*1024)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, big)
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	ph := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), logger, "")
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+	ph.ServeHTTP(rec, req)
+
+	// 透传仍是完整 body（截断只影响日志，不影响透传）。
+	if rec.Body.String() != big {
+		t.Errorf("passthrough body should be full, got len=%d want=%d", len(rec.Body.String()), len(big))
+	}
+	// 日志标注截断。
+	logOut := buf.String()
+	if !strings.Contains(logOut, "truncated=true") {
+		t.Errorf("log should mark truncated=true; got: %s", logOut)
+	}
+	if !strings.Contains(logOut, "body_bytes=16384") {
+		t.Errorf("log should record full body_bytes=16384; got: %s", logOut)
 	}
 }
 
