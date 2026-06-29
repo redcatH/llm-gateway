@@ -66,9 +66,36 @@ func DefaultRules(retryAfter int) []Rule {
 			// 10012 EngineInternalError + unsupported content type —— 模型不支持该内容类型
 			// （如纯文本模型收到 image_url），客户端错误，不可重试。
 			// 返回 400 + invalid_request_error，按请求路径区分 OpenAI/Anthropic 格式。
+			// 讯飞对此语义有多种文案变体，下方两条规则补全漏网文案。
 			Code:        10012,
 			MsgContains: []string{"EngineInternalError", "unsupported content type"},
 			Handler:     unsupportedContentTypeHandler(),
+		},
+		{
+			// 同上：英文文案变体 "Invalid content type. image_url is only supported by certain models"。
+			Code:        10012,
+			MsgContains: []string{"EngineInternalError", "Invalid content type"},
+			Handler:     unsupportedContentTypeHandler(),
+		},
+		{
+			// 同上：中文文案变体 "messages.content.type 参数非法，取值范围 ['text']"。
+			Code:        10012,
+			MsgContains: []string{"EngineInternalError", "参数非法"},
+			Handler:     unsupportedContentTypeHandler(),
+		},
+		{
+			// 10012 EngineInternalError + input token limit —— 上下文超长的另一种文案变体
+			// （"input token limit is XXXXX"），与 model_context_window_exceeded 同语义。
+			Code:        10012,
+			MsgContains: []string{"EngineInternalError", "input token limit"},
+			Handler:     contextExceededHandler(),
+		},
+		{
+			// 10012 EngineInternalError + "The system is busy" —— 1105 的英文描述版，可重试。
+			// 1105 规则在先（含 "1105" 的文案已被命中），此条兜底纯英文版文案。
+			Code:        10012,
+			MsgContains: []string{"EngineInternalError", "The system is busy"},
+			Handler:     retryableHandler(retryAfter),
 		},
 		{
 			// Anthropic overloaded_error —— 上游过载，客户端应重试。

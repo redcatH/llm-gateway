@@ -120,6 +120,47 @@ func TestProxyHandler(t *testing.T) {
 			wantBodyNotHas: "EngineInternalError",
 		},
 		{
+			// 10012 + Invalid content type（英文文案变体）→ 拦截为 400。
+			name:           "10012_invalid_content_type_intercepted_to_400",
+			upstreamStatus: http.StatusOK,
+			upstreamCT:     "text/event-stream",
+			upstreamBody:   `data: {"error":{"code":10012,"message":"Xunfei claude request failed with Sid: cht000d38d1@dx19f03008e55b8ab162 code: 10012, msg: EngineInternalError:error, status code: 400, status: 400 Bad Request, message: Invalid content type. image_url is only supported by certain models, timeStamp:16:16:37.896"}}` + "\n\n",
+			wantStatus:     http.StatusBadRequest,
+			wantBodyHas:    "only text is allowed",
+			wantBodyNotHas: "EngineInternalError",
+		},
+		{
+			// 10012 + 参数非法（中文文案变体）→ 拦截为 400。
+			name:           "10012_param_invalid_chinese_intercepted_to_400",
+			upstreamStatus: http.StatusOK,
+			upstreamCT:     "text/event-stream",
+			upstreamBody:   `data: {"error":{"code":10012,"message":"Xunfei claude request failed with Sid: cht000d4817@dx19f030097cab894652 code: 10012, msg: EngineInternalError:error, status code: 400, status: 400 Bad Request, message: messages.content.type 参数非法，取值范围 ['text'], timeStamp:16:16:41.175"}}` + "\n\n",
+			wantStatus:     http.StatusBadRequest,
+			wantBodyHas:    "only text is allowed",
+			wantBodyNotHas: "EngineInternalError",
+		},
+		{
+			// 10012 + input token limit（上下文超长文案变体）→ 拦截为 400 + context_length_exceeded。
+			name:           "10012_input_token_limit_intercepted_to_400",
+			upstreamStatus: http.StatusOK,
+			upstreamCT:     "text/event-stream",
+			upstreamBody:   `data: {"error":{"code":10012,"message":"Xunfei request failed with Sid: cht000d5627@dx19f06c95e3ab828262 code: 10012, msg: EngineInternalError:error, status code: 400, status: 400 Bad Request, message: input token limit is 202752, timeStamp:09:54:52.353"}}` + "\n\n",
+			wantStatus:     http.StatusBadRequest,
+			wantBodyHas:    "context_length_exceeded",
+			wantBodyNotHas: "EngineInternalError",
+		},
+		{
+			// 10012 + The system is busy（1105 英文描述版）→ 拦截为 503 + Retry-After。
+			name:           "10012_the_system_is_busy_intercepted_to_503",
+			upstreamStatus: http.StatusOK,
+			upstreamCT:     "text/event-stream",
+			upstreamBody:   `data: {"error":{"code":10012,"message":"Xunfei request failed with Sid: cht000dc15e@dx19efff4a635b894652 code: 10012, msg: EngineInternalError:The system is busy, please try again later., timeStamp:02:04:58.461"}}` + "\n\n",
+			wantStatus:     http.StatusServiceUnavailable,
+			wantBodyHas:    "upstream engine busy",
+			wantBodyNotHas: "EngineInternalError",
+			wantHeader:     "Retry-After",
+		},
+		{
 			// Anthropic 格式但 error_type 不在规则中 → 透传。
 			name:           "anthropic_unruled_passthrough",
 			upstreamStatus: http.StatusOK,
