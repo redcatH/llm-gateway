@@ -943,3 +943,33 @@ func TestModelRewriteDoesNotBreakErrorIntercept(t *testing.T) {
 		t.Errorf("expected intercept body; got %q", rec.Body.String())
 	}
 }
+
+// TestForwardStreamIncompleteEvent 验证流末尾无空行边界、直接 EOF 时 forwardStream
+// 不死循环，且已读字节（含改写）正常写出。锁死 readEvent "EOF 优先于空行边界判断" 的修复
+// （proxy.go:201 err 检查前移）——若顺序颠倒，EOF 被空行分支吞掉返回 (空,nil)，循环死等，
+// 本测试会触发 -timeout 超时。
+func TestForwardStreamIncompleteEvent(t *testing.T) {
+	rc := RewriteConfig{Mode: ModeDefault, Map: map[string]string{"xopglm51": "glm-5.1"}, Default: "glm-default"}
+	// 上游 body 只有一行 data，无结尾空行（\n\n）即结束 → readEvent 读一行后遇 EOF。
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"model\":\"xopglm51\"}\n")
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	h := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), slog.Default(), "", rc)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+	h.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "glm-5.1") {
+		t.Errorf("expected rewritten model glm-5.1 in body; got %q", body)
+	}
+	if strings.Contains(body, "xopglm51") {
+		t.Errorf("real name leaked; got %q", body)
+	}
+}
