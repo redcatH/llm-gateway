@@ -16,11 +16,15 @@ if "%LOG_MAX_AGE%"==""        set LOG_MAX_AGE=0
 if "%LOG_COMPRESS%"==""       set LOG_COMPRESS=true
 if "%SSE_INTERCEPT_ENABLED%"=="" set SSE_INTERCEPT_ENABLED=true
 if "%SSE_RETRY_AFTER%"==""       set SSE_RETRY_AFTER=5
+if "%MODEL_REWRITE_MODE%"==""    set MODEL_REWRITE_MODE=off
+if "%MODEL_MAP%"==""             set MODEL_MAP=
+if "%MODEL_DEFAULT%"==""         set MODEL_DEFAULT=
 
 echo [llm-gateway] UPSTREAM_OPENAI=%UPSTREAM_OPENAI_URL%
 echo [llm-gateway] UPSTREAM_ANTHROPIC=%UPSTREAM_ANTHROPIC_URL%
 echo [llm-gateway] LISTEN_ADDR=%LISTEN_ADDR%
 echo [llm-gateway] SSE_INTERCEPT=%SSE_INTERCEPT_ENABLED%
+echo [llm-gateway] MODEL_REWRITE_MODE=%MODEL_REWRITE_MODE%
 echo [llm-gateway] LOG_LEVEL=%LOG_LEVEL%
 echo [llm-gateway] LOG_DIR=%LOG_DIR% (max_size=%LOG_MAX_SIZE%MB, max_backups=%LOG_MAX_BACKUPS%, compress=%LOG_COMPRESS%)
 echo.
