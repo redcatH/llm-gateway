@@ -11,6 +11,9 @@
 .env.*
 !.env.example
 
+# 本地启动脚本（用户本地调试用，模板见 start.example.bat）
+start.bat
+
 # 编辑器/IDE
 .idea/
 .vscode/
