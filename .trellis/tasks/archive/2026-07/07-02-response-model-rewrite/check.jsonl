@@ -1,0 +1,2 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Code Review Checklist：零第三方依赖、环境变量配置、错误不泄漏、slog 结构化、go vet 通过"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "校验日志级别用法、结构化格式、不记录敏感请求/响应体"}
