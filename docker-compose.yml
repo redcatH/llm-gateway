@@ -38,6 +38,10 @@ services:
       # SSE error 拦截：命中规则返回 503 + Retry-After，客户端 SDK 自动重试。
       SSE_INTERCEPT_ENABLED: ${SSE_INTERCEPT_ENABLED:-true}
       SSE_RETRY_AFTER: ${SSE_RETRY_AFTER:-5}
+      # 响应 model 改写：将上游真实模型名替换为对外展示名，隐藏实际模型。
+      MODEL_REWRITE_MODE: ${MODEL_REWRITE_MODE:-off}
+      MODEL_MAP: ${MODEL_MAP:-}
+      MODEL_DEFAULT: ${MODEL_DEFAULT:-}
     volumes:
       # 以 root 运行，无需手动 chown；日志直接写宿主机 ./logs 目录。
       - ./logs:/app/logs
