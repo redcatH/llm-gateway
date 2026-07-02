@@ -16,6 +16,8 @@
 - **不改变原内容**：业务头与请求体字节级透传，不解析、不重序列化。
 - **SSE error 拦截**：上游返回 200 但 SSE 流内夹带 error 时，首帧 peek 命中规则即拦截为 503 + `Retry-After`，
   让 OpenAI/Anthropic SDK 自动重试；未命中则原样透传，不破坏流。
+- **响应 model 改写**（可选）：将响应中的 `model` 字段从上游真实模型名改写为对外展示名，
+  隐藏实际模型；支持 `off` / `passthrough` / `default` 三种未命中策略，仅改响应、请求方向零改动。
 - **SSE 流式不变形**：`FlushInterval=-1` + 不设读写超时，逐 token 输出。
 - **文件日志**：`LOG_DIR` 启用后同步写文件，按大小滚动 + 自动清理；为空则仅 stdout。
 - **高并发**：每请求一个 goroutine + 上游连接池复用。
@@ -72,6 +74,36 @@
 拦截响应体为通用 JSON（`upstream_overloaded`），不泄漏上游供应商标识。
 关闭拦截（`SSE_INTERCEPT_ENABLED=false`）则全部走纯透传，不做 peek。
 
+## 响应 model 改写
+
+设置 `MODEL_REWRITE_MODE`（非 `off`）后，网关将响应中的 `model` 字段从上游真实模型名
+（如 `xopglm51`）改写为对外展示名（如 `glm-5.1`），使下游无法获知实际模型。
+**仅改响应方向，请求方向字节级透传不变。**
+
+覆盖四种响应组合：
+
+| 协议 | 流式 | 非流式 |
+|---|---|---|
+| OpenAI | 每个 chunk 顶层 `model` | 顶层 `model` |
+| Anthropic | 仅 `message_start` 的 `message.model` | 顶层 `model` |
+
+三种模式（`MODEL_REWRITE_MODE`）：
+
+| 模式 | 命中 `MODEL_MAP` | 未命中 |
+|---|---|---|
+| `off`（默认） | 不改写 | 不改写 |
+| `passthrough` | 改写为对外名 | 透传真名 |
+| `default` | 改写为对外名 | 改写为 `MODEL_DEFAULT` |
+
+说明：
+
+- 仅改 `model` 字段，其余字段（`id` / `content` / `usage` / `tool_calls` / `reasoning_content` / `thinking` 等）原样保留。
+- 仅对 2xx 成功响应改写；4xx/5xx 错误响应透传不改。
+- 改写后 body 长度变化，删除 `Content-Length` 由 Go 自动定界，下游不截断。
+- JSON 解析失败的帧保守原样透传，不中断流。
+- 与 SSE error 拦截正交：error 帧无 `model` 字段，两条路径互不干扰。
+- 需 `SSE_INTERCEPT_ENABLED=true`（改写随 ProxyHandler 路径生效；纯透传回退不接入改写）。
+
 ## 关于"不改变内容"的边界
 
 - 所有业务头（`Authorization`、`x-api-key`、`anthropic-version`、`anthropic-beta`、
@@ -102,6 +134,9 @@
 | `LOG_COMPRESS` | `true` | 是否 gzip 压缩旧日志 |
 | `SSE_INTERCEPT_ENABLED` | `true` | 是否启用 SSE error 拦截（关闭则纯透传） |
 | `SSE_RETRY_AFTER` | `5` | 拦截 503 响应的 `Retry-After` 秒数 |
+| `MODEL_REWRITE_MODE` | `off` | 响应 model 改写模式：`off`（关闭）/ `passthrough`（未命中透传真名）/ `default`（未命中用 `MODEL_DEFAULT`） |
+| `MODEL_MAP` | — | 真名→对外名映射，格式 `xopglm51:glm-5.1,xopglm52:glm-5.2` |
+| `MODEL_DEFAULT` | — | `default` 模式下未命中时的兜底对外名（该模式下必填） |
 
 ## 快速开始
 
@@ -223,8 +258,9 @@ hey -n 1000 -c 50 http://localhost:8080/anything
 │   ├── routing/routing.go         # 按路径选择 OpenAI / Anthropic 上游
 │   ├── proxy/proxy.go             # ReverseProxy 纯透传（拦截关闭时回退）
 │   ├── sse/
-│   │   ├── proxy.go               # SSE 首帧 peek + 拦截/透传
+│   │   ├── proxy.go               # SSE 首帧 peek + 拦截/透传 + model 改写集成
 │   │   ├── handler.go             # 命中决策（503 + Retry-After）+ DefaultRules
+│   │   ├── rewrite.go             # 响应 model 字段改写（RewriteConfig + 递归改写）
 │   │   └── rule.go                # 规则匹配（Code / ErrorType / MsgContains）
 │   ├── logdir/logdir.go           # 文件日志 handler（滚动 + stdout 多路输出）
 │   └── server/

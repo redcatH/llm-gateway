@@ -42,7 +42,7 @@ var hopByHopHeaders = []string{
 //
 // 分流依据是上游响应（resp.StatusCode==200 且 Content-Type 含 text/event-stream），
 // 而非请求的 Accept 头，更可靠。
-func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, transport http.RoundTripper, rules []Rule, logger *slog.Logger, logDir string) http.Handler {
+func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, transport http.RoundTripper, rules []Rule, logger *slog.Logger, logDir string, rc RewriteConfig) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		// 按请求协议（路径）选上游：/v1/messages → Anthropic，其余 → OpenAI。
 		target := routing.SelectTarget(req, openAITarget, anthropicTarget)
@@ -79,7 +79,7 @@ func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, tra
 
 		// 仅对 200 + SSE 响应做 peek 拦截；其余原样透传。
 		if resp.StatusCode == http.StatusOK && isSSEResponse(resp) {
-			handleSSEResponse(w, resp, rules, logger, req, reqBody, logDir)
+			handleSSEResponse(w, resp, rules, logger, req, reqBody, logDir, rc)
 			return
 		}
 		// 非流式 + 5xx → 记录响应体便于事后分析上游异常。
@@ -88,14 +88,20 @@ func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, tra
 		if resp.StatusCode >= 500 {
 			logNonSuccessResponse(logger, req, resp)
 		}
+		// 非流式 2xx + 启用改写 + JSON → 读全量改写 model；否则原样透传。
+		// 错误响应（4xx/5xx）与非 JSON body 不改写。
+		if rc.enabled() && resp.StatusCode == http.StatusOK && isJSONResponse(resp) {
+			copyResponseRewritten(w, resp, rc)
+			return
+		}
 		copyResponse(w, resp)
 	})
 }
 
 // handleSSEResponse 处理 200 + SSE 响应：peek 首帧，命中规则则拦截，否则放行续传。
-func handleSSEResponse(w http.ResponseWriter, resp *http.Response, rules []Rule, logger *slog.Logger, req *http.Request, reqBody []byte, logDir string) {
+func handleSSEResponse(w http.ResponseWriter, resp *http.Response, rules []Rule, logger *slog.Logger, req *http.Request, reqBody []byte, logDir string, rc RewriteConfig) {
 	br := bufio.NewReader(resp.Body)
-	peeked, err := readFirstEvent(br)
+	peeked, err := readEvent(br)
 
 	m, isErr := parseErrorEvent(peeked)
 	logger.Debug("sse first event peeked",
@@ -154,7 +160,7 @@ func handleSSEResponse(w http.ResponseWriter, resp *http.Response, rules []Rule,
 	if err != nil && err != io.EOF {
 		logger.Warn("peek first sse event ended with error, passing through", "err", err.Error(), "path", req.URL.Path)
 	}
-	forwardStream(w, resp, peeked, br)
+	forwardStream(w, resp, peeked, br, rc)
 }
 
 // buildUpstreamRequest 构造转发到上游的请求：
@@ -180,21 +186,24 @@ func buildUpstreamRequest(req *http.Request, target *url.URL, preserveHost bool)
 	return outReq
 }
 
-// readFirstEvent 从 bufio.Reader 读取第一个完整的 SSE 事件（以空行分隔）。
+// readEvent 从 bufio.Reader 读取一个完整的 SSE 事件（以空行分隔）。
 // 返回该事件的原始字节（含事件边界空行）。遇到 EOF 时返回已读字节与 io.EOF。
-func readFirstEvent(br *bufio.Reader) ([]byte, error) {
+// 首帧与后续帧共用：handleSSEResponse peek 首帧，forwardStream 逐帧续读。
+func readEvent(br *bufio.Reader) ([]byte, error) {
 	var buf bytes.Buffer
 	for {
 		line, err := br.ReadBytes('\n')
 		if len(line) > 0 {
 			buf.Write(line)
 		}
+		// EOF/错误必须优先返回，否则空 line 会命中下方"空行=边界"分支，
+		// 吞掉 EOF 导致 forwardStream 循环死等下一个事件。
+		if err != nil {
+			return buf.Bytes(), err
+		}
 		// 空行（去掉行尾 \r\n 后为空）= 事件边界。
 		if len(bytes.TrimRight(line, "\r\n")) == 0 {
 			return buf.Bytes(), nil
-		}
-		if err != nil {
-			return buf.Bytes(), err
 		}
 	}
 }
@@ -292,6 +301,27 @@ func isSSEResponse(resp *http.Response) bool {
 	return strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
 }
 
+// isJSONResponse 判断上游响应是否为 JSON（非流式 model 改写的准入条件）。
+func isJSONResponse(resp *http.Response) bool {
+	return strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "application/json")
+}
+
+// copyResponseRewritten 读全量 body，改写 model 后写出（非流式 2xx JSON 路径）。
+// 改写后 body 长度可能变化，删除 Content-Length 让 Go 自动定界（chunked 或重算）。
+// 解析失败 / 无需改时 rewriteModelJSON 原样返回 body，等价透传。
+func copyResponseRewritten(w http.ResponseWriter, resp *http.Response, rc RewriteConfig) {
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	out := rewriteModelJSON(body, rc)
+	copyHeader(w.Header(), resp.Header)
+	w.Header().Del("Content-Length")
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(out)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 // logNonSuccessResponse 记录上游 5xx 响应的 body 内容，便于事后分析上游异常。
 // 读全量 body 后用 NopCloser 重置 resp.Body，保证后续 copyResponse 透传不受影响。
 // body 超过 maxLogBodyBytes 时截断并标注，防止超大响应撑爆日志。
@@ -337,13 +367,16 @@ func copyResponse(w http.ResponseWriter, resp *http.Response) {
 }
 
 // forwardStream 放行 SSE 流：写响应头 + 已 peek 字节 + 剩余 body，逐帧 flush。
-// 已 peek 的字节先写出再续传剩余，保证透传字节级完整。
+// 启用改写时（rc.enabled），对每个 SSE 事件按需改写 model 后再写出；
+// 未启用或事件不含 model 时 rewriteSSEEvent 字节级原样返回。
 //
-// 关键：剩余 body 必须逐块读 + 每次立即 flush，不能用 io.Copy——
+// 关键：剩余 body 必须逐事件读 + 每次立即 flush，不能用 io.Copy——
 // io.Copy 用 32KB 缓冲且不 flush，< 32KB 的响应会缓冲到 EOF 才下发，
 // 破坏 SSE 逐帧流式（下游要等所有内容到达才收到）。
-func forwardStream(w http.ResponseWriter, resp *http.Response, peeked []byte, br *bufio.Reader) {
+func forwardStream(w http.ResponseWriter, resp *http.Response, peeked []byte, br *bufio.Reader, rc RewriteConfig) {
 	copyHeader(w.Header(), resp.Header)
+	// 改写可能改变字节数；流式本无 Content-Length，Del 统一处理（无此头时为 no-op）。
+	w.Header().Del("Content-Length")
 	w.WriteHeader(resp.StatusCode)
 	flusher, _ := w.(http.Flusher)
 	flush := func() {
@@ -351,16 +384,16 @@ func forwardStream(w http.ResponseWriter, resp *http.Response, peeked []byte, br
 			flusher.Flush()
 		}
 	}
+	// 首帧（已 peek）：含 model 则改写后写出，否则原样。
 	if len(peeked) > 0 {
-		_, _ = w.Write(peeked)
+		_, _ = w.Write(rewriteSSEEvent(peeked, rc))
 		flush()
 	}
-	// 逐块读取剩余 body，每块立即 flush，保证 SSE 逐帧下发。
-	buf := make([]byte, 4096)
+	// 逐事件读取剩余 body，每个事件按需改写后立即 flush，保证 SSE 逐帧下发。
 	for {
-		n, err := br.Read(buf)
-		if n > 0 {
-			_, _ = w.Write(buf[:n])
+		event, err := readEvent(br)
+		if len(event) > 0 {
+			_, _ = w.Write(rewriteSSEEvent(event, rc))
 			flush()
 		}
 		if err != nil {

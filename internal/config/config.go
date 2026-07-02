@@ -52,6 +52,15 @@ type Config struct {
 	SSEInterceptEnabled bool
 	// SSERetryAfter 是拦截后 503 响应的 Retry-After 秒数。
 	SSERetryAfter int
+
+	// ModelRewriteMode 控制响应 model 字段改写模式：
+	//   off（默认，关闭）/ passthrough（未命中透传真名）/ default（未命中用 ModelDefault）。
+	ModelRewriteMode string
+	// ModelMap 是真实模型名→对外展示名的映射，仅 passthrough/default 模式生效。
+	// 来自 MODEL_MAP 环境变量，格式 "key:value,key:value"。
+	ModelMap map[string]string
+	// ModelDefault 是 default 模式下未命中时的兜底对外名。
+	ModelDefault string
 }
 
 // Load 从环境变量读取并校验配置。缺少必填项或格式非法时返回错误，
@@ -83,6 +92,20 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
+	modelMap, err := parseModelMap("MODEL_MAP")
+	if err != nil {
+		return nil, err
+	}
+	modelRewriteMode, err := parseRewriteMode("MODEL_REWRITE_MODE")
+	if err != nil {
+		return nil, err
+	}
+	modelDefault := envString("MODEL_DEFAULT", "")
+	// default 模式必须提供兜底名，否则未命中时无值可填。
+	if modelRewriteMode == "default" && modelDefault == "" {
+		return nil, fmt.Errorf("MODEL_DEFAULT is required when MODEL_REWRITE_MODE=default")
+	}
+
 	return &Config{
 		OpenAITarget:               openaiURL,
 		AnthropicTarget:            anthropicURL,
@@ -100,6 +123,9 @@ func Load() (*Config, error) {
 		LogCompress:                envBool("LOG_COMPRESS", true),
 		SSEInterceptEnabled:        envBool("SSE_INTERCEPT_ENABLED", true),
 		SSERetryAfter:              retryAfter,
+		ModelRewriteMode:           modelRewriteMode,
+		ModelMap:                   modelMap,
+		ModelDefault:               modelDefault,
 	}, nil
 }
 
@@ -192,5 +218,47 @@ func envLevel(key string, def slog.Level) slog.Level {
 		return slog.LevelInfo
 	default:
 		return def
+	}
+}
+
+// parseModelMap 解析 MODEL_MAP 环境变量为真名→对外名映射。
+// 格式 "key:value,key:value"；空字符串返回 nil（不报错，功能关闭）。
+// 条目缺少冒号或 key 为空视为格式非法，返回错误。
+// value 允许含冒号（按第一个冒号分割）。
+func parseModelMap(key string) (map[string]string, error) {
+	raw := os.Getenv(key)
+	if raw == "" {
+		return nil, nil
+	}
+	m := make(map[string]string)
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue // 容忍首尾/连续逗号
+		}
+		idx := strings.Index(entry, ":")
+		if idx <= 0 {
+			return nil, fmt.Errorf("invalid %s entry %q: expected 'key:value'", key, entry)
+		}
+		k := strings.TrimSpace(entry[:idx])
+		v := strings.TrimSpace(entry[idx+1:])
+		if k == "" {
+			return nil, fmt.Errorf("invalid %s entry %q: empty key", key, entry)
+		}
+		m[k] = v
+	}
+	return m, nil
+}
+
+// parseRewriteMode 解析 MODEL_REWRITE_MODE：off/passthrough/default。
+// 空值默认 off；非法值返回错误。值转小写，大小写不敏感。
+func parseRewriteMode(key string) (string, error) {
+	switch v := strings.ToLower(strings.TrimSpace(os.Getenv(key))); v {
+	case "", "off":
+		return "off", nil
+	case "passthrough", "default":
+		return v, nil
+	default:
+		return "", fmt.Errorf("invalid %s %q: must be off/passthrough/default", key, v)
 	}
 }

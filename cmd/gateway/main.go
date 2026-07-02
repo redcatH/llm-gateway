@@ -66,7 +66,12 @@ func main() {
 	var handler http.Handler
 	if cfg.SSEInterceptEnabled {
 		rules := sse.DefaultRules(cfg.SSERetryAfter)
-		handler = sse.ProxyHandler(cfg.OpenAITarget, cfg.AnthropicTarget, cfg.PreserveHost, transport, rules, logger, cfg.LogDir)
+		rc := sse.RewriteConfig{
+			Mode:    cfg.ModelRewriteMode,
+			Map:     cfg.ModelMap,
+			Default: cfg.ModelDefault,
+		}
+		handler = sse.ProxyHandler(cfg.OpenAITarget, cfg.AnthropicTarget, cfg.PreserveHost, transport, rules, logger, cfg.LogDir, rc)
 	} else {
 		handler = proxy.New(cfg, transport, logger)
 	}
@@ -80,6 +85,7 @@ func main() {
 		"preserve_host", cfg.PreserveHost,
 		"sse_intercept", cfg.SSEInterceptEnabled,
 		"max_idle_conns_per_host", cfg.MaxIdleConnsPerHost,
+		"model_rewrite_mode", cfg.ModelRewriteMode,
 	)
 
 	// 在独立 goroutine 中监听，主 goroutine 等待退出信号。

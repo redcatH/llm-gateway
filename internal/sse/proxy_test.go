@@ -218,7 +218,7 @@ func TestProxyHandler(t *testing.T) {
 			defer upstream.Close()
 
 			target, _ := url.Parse(upstream.URL)
-			h := ProxyHandler(target, target, false, http.DefaultTransport, rules, slog.Default(), "")
+			h := ProxyHandler(target, target, false, http.DefaultTransport, rules, slog.Default(), "", RewriteConfig{})
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"stream":true}`))
@@ -263,7 +263,7 @@ func TestProxyHandlerRouting(t *testing.T) {
 
 	openaiURL, _ := url.Parse(openai.URL)
 	anthropicURL, _ := url.Parse(anthropic.URL)
-	h := ProxyHandler(openaiURL, anthropicURL, false, http.DefaultTransport, DefaultRules(5), slog.Default(), "")
+	h := ProxyHandler(openaiURL, anthropicURL, false, http.DefaultTransport, DefaultRules(5), slog.Default(), "", RewriteConfig{})
 
 	cases := []struct {
 		path    string
@@ -301,7 +301,7 @@ func TestNonSuccessResponseLogged(t *testing.T) {
 	defer upstream.Close()
 
 	target, _ := url.Parse(upstream.URL)
-	ph := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), logger, "")
+	ph := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), logger, "", RewriteConfig{})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
@@ -345,7 +345,7 @@ func Test4xxNotLogged(t *testing.T) {
 	defer upstream.Close()
 
 	target, _ := url.Parse(upstream.URL)
-	ph := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), logger, "")
+	ph := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), logger, "", RewriteConfig{})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
@@ -380,7 +380,7 @@ func TestNonSuccessResponseTruncated(t *testing.T) {
 	defer upstream.Close()
 
 	target, _ := url.Parse(upstream.URL)
-	ph := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), logger, "")
+	ph := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), logger, "", RewriteConfig{})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
@@ -578,7 +578,7 @@ func TestUnmatched10012DumpsRequestBody(t *testing.T) {
 
 	dir := t.TempDir()
 	target, _ := url.Parse(upstream.URL)
-	h := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), slog.Default(), dir)
+	h := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), slog.Default(), dir, RewriteConfig{})
 
 	reqBody := `{"messages":[{"role":"tool","tool_call_id":"x","content":"r"}]}`
 	rec := httptest.NewRecorder()
@@ -633,7 +633,7 @@ func TestNoDumpWhenNot10012BadRequest(t *testing.T) {
 
 			dir := t.TempDir()
 			target, _ := url.Parse(upstream.URL)
-			h := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), slog.Default(), dir)
+			h := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), slog.Default(), dir, RewriteConfig{})
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"messages":[]}`))
@@ -704,7 +704,7 @@ func TestBadRequestFormatByProtocol(t *testing.T) {
 			defer upstream.Close()
 
 			target, _ := url.Parse(upstream.URL)
-			h := ProxyHandler(target, target, false, http.DefaultTransport, rules, slog.Default(), "")
+			h := ProxyHandler(target, target, false, http.DefaultTransport, rules, slog.Default(), "", RewriteConfig{})
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodPost, c.path, strings.NewReader(`{}`))
@@ -791,4 +791,155 @@ func TestFormatBadRequest(t *testing.T) {
 			t.Errorf("empty code should serialize as null, got %v", errObj["code"])
 		}
 	})
+}
+
+// TestModelRewrite 端到端验证响应 model 字段改写：四种响应组合 × 三模式。
+func TestModelRewrite(t *testing.T) {
+	rcDefault := RewriteConfig{
+		Mode:    ModeDefault,
+		Map:     map[string]string{"xopglm51": "glm-5.1", "xopglm52": "glm-5.2"},
+		Default: "glm-default",
+	}
+	rcPassthrough := RewriteConfig{
+		Mode: ModePassthrough,
+		Map:  map[string]string{"xopglm51": "glm-5.1", "xopglm52": "glm-5.2"},
+	}
+
+	cases := []struct {
+		name         string
+		rc           RewriteConfig
+		path         string
+		upstreamCT   string
+		upstreamBody string
+		wantNotHas   string // 不应出现的子串（如真实模型名）
+		wantHas      []string // 应出现的子串（对外名 / 透传内容）
+	}{
+		{
+			// OpenAI 流式：每个 chunk 顶层 model，多帧均改写。
+			name:         "openai_stream_default",
+			rc:           rcDefault,
+			path:         "/v1/chat/completions",
+			upstreamCT:   "text/event-stream",
+			upstreamBody: "data: {\"model\":\"xopglm52\",\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"model\":\"xopglm52\",\"choices\":[{\"delta\":{\"content\":\"there\"}}]}\n\ndata: [DONE]\n\n",
+			wantNotHas:   "xopglm52",
+			wantHas:      []string{"glm-5.2", "[DONE]"},
+		},
+		{
+			// OpenAI 流式 reasoning_content（思考模式）：顶层 model 改写，reasoning 内容保留。
+			name:         "openai_stream_reasoning",
+			rc:           rcDefault,
+			path:         "/v1/chat/completions",
+			upstreamCT:   "text/event-stream",
+			upstreamBody: "data: {\"model\":\"xopglm52\",\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}\n\n",
+			wantNotHas:   "xopglm52",
+			wantHas:      []string{"glm-5.2", `"reasoning_content":"thinking"`},
+		},
+		{
+			// OpenAI 非流式：顶层 model。
+			name:         "openai_nonstream_default",
+			rc:           rcDefault,
+			path:         "/v1/chat/completions",
+			upstreamCT:   "application/json",
+			upstreamBody: `{"id":"1","model":"xopglm51","choices":[{"message":{"content":"hi"}}]}`,
+			wantNotHas:   "xopglm51",
+			wantHas:      []string{"glm-5.1", `"content":"hi"`},
+		},
+		{
+			// Anthropic 流式：仅 message_start 的 message.model 改写；content_block_delta 无 model 原样透传。
+			name:         "anthropic_stream_default",
+			rc:           rcDefault,
+			path:         "/v1/messages",
+			upstreamCT:   "text/event-stream",
+			upstreamBody: "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"xopglm51\"}}\n\nevent: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"hi\"}}\n\n",
+			wantNotHas:   "xopglm51",
+			wantHas:      []string{"glm-5.1", `"text":"hi"`, "content_block_delta"},
+		},
+		{
+			// Anthropic 非流式：顶层 model，未命中 → default。
+			name:         "anthropic_nonstream_default_miss",
+			rc:           rcDefault,
+			path:         "/v1/messages",
+			upstreamCT:   "application/json",
+			upstreamBody: `{"id":"1","model":"xopglmv47flash","content":[{"type":"text","text":"hi"}]}`,
+			wantNotHas:   "xopglmv47flash",
+			wantHas:      []string{"glm-default"},
+		},
+		{
+			// passthrough 未命中：透传真名。
+			name:         "openai_stream_passthrough_miss",
+			rc:           rcPassthrough,
+			path:         "/v1/chat/completions",
+			upstreamCT:   "text/event-stream",
+			upstreamBody: "data: {\"model\":\"xopglmv47flash\",\"choices\":[]}\n\n",
+			wantHas:      []string{"xopglmv47flash"},
+		},
+		{
+			// off 模式：不改写，保留真名。
+			name:         "openai_nonstream_off",
+			rc:           RewriteConfig{Mode: ModeOff},
+			path:         "/v1/chat/completions",
+			upstreamCT:   "application/json",
+			upstreamBody: `{"model":"xopglm51"}`,
+			wantHas:      []string{"xopglm51"},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", c.upstreamCT)
+				w.WriteHeader(http.StatusOK)
+				_, _ = io.WriteString(w, c.upstreamBody)
+			}))
+			defer upstream.Close()
+
+			target, _ := url.Parse(upstream.URL)
+			h := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), slog.Default(), "", c.rc)
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, c.path, strings.NewReader(`{}`))
+			h.ServeHTTP(rec, req)
+
+			body := rec.Body.String()
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200; body=%q", rec.Code, body)
+			}
+			if c.wantNotHas != "" && strings.Contains(body, c.wantNotHas) {
+				t.Errorf("body should not contain %q; got %q", c.wantNotHas, body)
+			}
+			for _, has := range c.wantHas {
+				if !strings.Contains(body, has) {
+					t.Errorf("body missing %q; got %q", has, body)
+				}
+			}
+		})
+	}
+}
+
+// TestModelRewriteDoesNotBreakErrorIntercept 验证启用改写时 SSE error 拦截仍正常工作。
+// error 帧无 model 字段，改写与拦截字段正交、互不干扰。
+func TestModelRewriteDoesNotBreakErrorIntercept(t *testing.T) {
+	rc := RewriteConfig{Mode: ModeDefault, Map: map[string]string{"xopglm51": "glm-5.1"}, Default: "glm-default"}
+	upstreamBody := `data: {"error":{"code":10012,"message":"Xunfei ... EngineInternalError:1105|{\"Code\":1105}"}}` + "\n\n"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, upstreamBody)
+	}))
+	defer upstream.Close()
+
+	target, _ := url.Parse(upstream.URL)
+	h := ProxyHandler(target, target, false, http.DefaultTransport, DefaultRules(5), slog.Default(), "", rc)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{}`))
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (error intercept should still fire); body=%q", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "upstream engine busy") {
+		t.Errorf("expected intercept body; got %q", rec.Body.String())
+	}
 }

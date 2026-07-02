@@ -16,7 +16,8 @@
 - ❌ 引入第三方依赖（viper、gin、logrus 等）——项目刻意保持零依赖。
 - ❌ 硬编码配置值——所有可配置项通过环境变量注入。
 - ❌ 设置 `ReadTimeout`/`WriteTimeout`——会切断 SSE 长连接。
-- ❌ 在代理层修改请求头或请求体——违反透明透传原则。
+- ❌ 在代理层修改**请求**头或**请求**体——违反透明透传原则。
+  - **例外**：**响应方向**的有意改写（SSE error 拦截、`model` 字段改写）是允许的，请求方向仍零改动。可执行契约见 [response-rewrite.md](./response-rewrite.md)。
 - ❌ `panic` 处理可预见错误。
 - ❌ `console.log` 等价物——生产代码不用 `fmt.Println`，统一用 `slog`。
 
