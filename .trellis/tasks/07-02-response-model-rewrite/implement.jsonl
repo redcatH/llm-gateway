@@ -1,2 +1,0 @@
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "零依赖/环境变量/不修改请求体等硬约束；响应 model 改写是有意打破响应透传，与 error 拦截同列为例外"}
-{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "mapModel 未命中 warn 是首批 warn 用例；结构化 slog 键值对；不记请求/响应体"}
