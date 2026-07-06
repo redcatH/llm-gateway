@@ -330,10 +330,11 @@ func TestNonSuccessResponseLogged(t *testing.T) {
 	}
 }
 
-// Test4xxNotLogged 验证 4xx（客户端错误）不记日志，仍原样透传。
-func Test4xxNotLogged(t *testing.T) {
+// Test4xxLoggedAsWarn 验证 4xx（客户端错误）记 Warn 级别日志（含 body），仍原样透传。
+func Test4xxLoggedAsWarn(t *testing.T) {
 	var buf bytes.Buffer
-	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelError})
+	// handler 级别放到 Warn，才能捕获 4xx 的 Warn 日志。
+	h := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})
 	logger := slog.New(h)
 
 	upstreamBody := `{"error":{"message":"invalid api key"}}`
@@ -358,9 +359,17 @@ func Test4xxNotLogged(t *testing.T) {
 	if rec.Body.String() != upstreamBody {
 		t.Errorf("body not byte-exact\ngot:  %q\nwant: %q", rec.Body.String(), upstreamBody)
 	}
-	// 4xx 不应产生上游异常日志。
-	if strings.Contains(buf.String(), "upstream non-success response") {
-		t.Errorf("4xx should not be logged as upstream error; got: %s", buf.String())
+	// 4xx 记 Warn（不是 Error）：日志含 body、status、path，且级别为 WARN。
+	logOut := buf.String()
+	for _, want := range []string{
+		"level=WARN",
+		"upstream non-success response",
+		"status=401",
+		`invalid api key`,
+	} {
+		if !strings.Contains(logOut, want) {
+			t.Errorf("log missing %q\ngot: %s", want, logOut)
+		}
 	}
 }
 

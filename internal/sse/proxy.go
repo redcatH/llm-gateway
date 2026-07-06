@@ -82,10 +82,11 @@ func ProxyHandler(openAITarget, anthropicTarget *url.URL, preserveHost bool, tra
 			handleSSEResponse(w, resp, rules, logger, req, reqBody, logDir, rc)
 			return
 		}
-		// 非流式 + 5xx → 记录响应体便于事后分析上游异常。
-		// 4xx 属客户端错误（如 401/404），不算上游异常，不记。
+		// 非流式 + 4xx/5xx → 记录响应体便于事后分析。
+		// 5xx 是上游故障记 Error；4xx 虽属客户端错误，但讯飞常把真实错误码
+		// 包装在 400 body 里（同 500 包装 1105 的模式），不记则无法定位，记 Warn。
 		// 读全量 body 后重置 resp.Body，不影响后续透传。
-		if resp.StatusCode >= 500 {
+		if resp.StatusCode >= 400 {
 			logNonSuccessResponse(logger, req, resp)
 		}
 		// 非流式 2xx + 启用改写 + JSON → 读全量改写 model；否则原样透传。
@@ -322,20 +323,26 @@ func copyResponseRewritten(w http.ResponseWriter, resp *http.Response, rc Rewrit
 	}
 }
 
-// logNonSuccessResponse 记录上游 5xx 响应的 body 内容，便于事后分析上游异常。
+// logNonSuccessResponse 记录上游 4xx/5xx 响应的 body 内容，便于事后分析。
+// 5xx 记 Error（上游故障）；4xx 记 Warn（客户端错误，但讯飞常把真实错误码包装在 400 body 里）。
 // 读全量 body 后用 NopCloser 重置 resp.Body，保证后续 copyResponse 透传不受影响。
 // body 超过 maxLogBodyBytes 时截断并标注，防止超大响应撑爆日志。
 //
-// 遵循 logging-guidelines "What NOT to Log" 的 5xx 例外：
-// 仅 status>=500 触发、截断上限 8KB、不记认证头。详见 .trellis/spec/backend/logging-guidelines.md。
+// 遵循 logging-guidelines "What NOT to Log" 的例外：
+// status>=400 触发、截断上限 8KB、不记认证头。详见 .trellis/spec/backend/logging-guidelines.md。
 func logNonSuccessResponse(logger *slog.Logger, req *http.Request, resp *http.Response) {
 	const maxLogBodyBytes = 8 * 1024 // 8KB 上限，足够覆盖上游错误体
+	// 5xx 上游故障 → Error；4xx 客户端错误 → Warn。
+	logFn := logger.Error
+	if resp.StatusCode < 500 {
+		logFn = logger.Warn
+	}
 	body, err := io.ReadAll(resp.Body)
 	resp.Body.Close()
 	// err 时 body 为已读部分，透传不中断；正常时为完整 body。
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	if err != nil {
-		logger.Error("upstream non-success response (body read failed)",
+		logFn("upstream non-success response (body read failed)",
 			"path", req.URL.Path,
 			"status", resp.StatusCode,
 			"content_type", resp.Header.Get("Content-Type"),
@@ -349,7 +356,7 @@ func logNonSuccessResponse(logger *slog.Logger, req *http.Request, resp *http.Re
 	if truncated {
 		logBody = body[:maxLogBodyBytes]
 	}
-	logger.Error("upstream non-success response",
+	logFn("upstream non-success response",
 		"path", req.URL.Path,
 		"status", resp.StatusCode,
 		"content_type", resp.Header.Get("Content-Type"),
