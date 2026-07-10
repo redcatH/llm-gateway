@@ -150,10 +150,20 @@ func handleSSEResponse(w http.ResponseWriter, resp *http.Response, rules []Rule,
 				"request_id", req.Header.Get("X-Request-Id"),
 			)
 			// 客服反馈的"孤立 tool 消息"类错误（10012 EngineInternalError:Bad Request）：
-			// 转储完整请求体到独立文件，便于事后排查 messages 异常。结果仍照常透传。
+			// 转储完整请求体到独立文件，便于事后排查 messages 异常。
 			if is10012BadRequest(m) {
 				dumpRequestBody(logDir, dumpFileName(req, time.Now()), reqBody, logger)
 			}
+			// 未命中规则 → 视为不可重试错误，拦截为 422 + 原始 JSON payload。
+			// 422 属 4xx，下游（new-api/sub2api）不重试 4xx，避免盲目重试放大未知错误；
+			// 也不触发 401/403 的渠道禁用。body 透传 m.Raw（parseErrorEvent 提取的纯 JSON）。
+			writeDecision(w, Decision{
+				Intercept: true,
+				Status:    http.StatusUnprocessableEntity, // 422
+				Body:      m.Raw,
+				Headers:   jsonHeader(),
+			})
+			return
 		}
 	}
 

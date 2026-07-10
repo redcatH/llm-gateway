@@ -39,12 +39,13 @@ func TestProxyHandler(t *testing.T) {
 			wantHeader:     "Retry-After",
 		},
 		{
-			name:           "10012_bad_request_subtype_passthrough",
+			// 10012 Bad Request 子类型未命中规则 → 拦截 422 + 纯 JSON payload（无 logDir 不 dump）。
+			name:           "10012_bad_request_subtype_intercepted_to_422",
 			upstreamStatus: http.StatusOK,
 			upstreamCT:     "text/event-stream",
 			upstreamBody:   `data: {"error":{"code":10012,"message":"Xunfei ... EngineInternalError:Bad Request, timeStamp:00:00:00"}}` + "\n\n",
-			wantStatus:     http.StatusOK,
-			wantBodyExact:  `data: {"error":{"code":10012,"message":"Xunfei ... EngineInternalError:Bad Request, timeStamp:00:00:00"}}` + "\n\n",
+			wantStatus:     http.StatusUnprocessableEntity,
+			wantBodyExact:  `{"error":{"code":10012,"message":"Xunfei ... EngineInternalError:Bad Request, timeStamp:00:00:00"}}`,
 		},
 		{
 			name:           "10010_engine_busy_intercepted_to_503",
@@ -162,22 +163,22 @@ func TestProxyHandler(t *testing.T) {
 			wantHeader:     "Retry-After",
 		},
 		{
-			// Anthropic 格式但 error_type 不在规则中 → 透传。
-			name:           "anthropic_unruled_passthrough",
+			// Anthropic 格式但 error_type 不在规则中 → 未命中拦截为 422 + 纯 JSON payload。
+			name:           "anthropic_unruled_intercepted_to_422",
 			upstreamStatus: http.StatusOK,
 			upstreamCT:     "text/event-stream",
 			upstreamBody:   "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n",
-			wantStatus:     http.StatusOK,
-			wantBodyExact:  "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"bad input\"}}\n\n",
+			wantStatus:     http.StatusUnprocessableEntity,
+			wantBodyExact:  `{"type":"error","error":{"type":"invalid_request_error","message":"bad input"}}`,
 		},
 		{
-			// 10300 未配置规则 → 仍透传，证明只拦已知 code。
-			name:           "10300_unruled_passthrough",
+			// 10300 未配置规则 → 未命中拦截为 422 + 纯 JSON payload。
+			name:           "10300_unruled_intercepted_to_422",
 			upstreamStatus: http.StatusOK,
 			upstreamCT:     "text/event-stream",
 			upstreamBody:   `data: {"error":{"code":10300,"message":"Xunfei ... read message from mom expired"}}` + "\n\n",
-			wantStatus:     http.StatusOK,
-			wantBodyExact:  `data: {"error":{"code":10300,"message":"Xunfei ... read message from mom expired"}}` + "\n\n",
+			wantStatus:     http.StatusUnprocessableEntity,
+			wantBodyExact:  `{"error":{"code":10300,"message":"Xunfei ... read message from mom expired"}}`,
 		},
 		{
 			name:           "normal_stream_passthrough_byte_exact",
@@ -596,12 +597,12 @@ func TestUnmatched10012DumpsRequestBody(t *testing.T) {
 	req.Header.Set("X-Request-Id", "test-req-1")
 	h.ServeHTTP(rec, req)
 
-	// 行为不变：200 透传，字节级一致。
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", rec.Code)
+	// 行为：未命中规则 → 拦截 422 + 纯 JSON payload（m.Raw，去掉 data: 前缀）。
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", rec.Code)
 	}
-	if rec.Body.String() != upstreamBody {
-		t.Errorf("body not byte-exact\ngot:  %q\nwant: %q", rec.Body.String(), upstreamBody)
+	if rec.Body.String() != `{"error":{"code":10012,"message":"Xunfei request failed with Sid: x@dx code: 10012, msg: EngineInternalError:Bad Request, timeStamp:00:00:00"}}` {
+		t.Errorf("body not the raw JSON payload\ngot:  %q\nwant: {\"error\":{...EngineInternalError:Bad Request...}}", rec.Body.String())
 	}
 
 	// dump 文件存在且内容 == 原始请求体（完整未截断）。
